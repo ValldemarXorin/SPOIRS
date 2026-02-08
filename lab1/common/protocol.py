@@ -1,28 +1,36 @@
 """Протокол обмена сообщениями между клиентом и сервером."""
-
 from dataclasses import dataclass
-from typing import Optional, Tuple
-from enum import Enum, auto
+from typing import Optional, List
+from enum import Enum
 
 
 class CommandType(Enum):
     """Типы поддерживаемых команд."""
-    ECHO = auto()
-    TIME = auto()
-    QUIT = auto()
-    UPLOAD = auto()
-    DOWNLOAD = auto()
-    RESUME_UPLOAD = auto()
-    RESUME_DOWNLOAD = auto()
-    UNKNOWN = auto()
+    ECHO = 1
+    TIME = 2
+    QUIT = 3
+    UPLOAD = 4
+    DOWNLOAD = 5
+    RESUME_UPLOAD = 6
+    RESUME_DOWNLOAD = 7
+    UNKNOWN = 8
+
+
+class PacketType(Enum):
+    """Типы пакетов RUDP."""
+    DATA = 0
+    ACK = 1
+    FIN = 2
+    CMD = 3
 
 
 @dataclass
 class Command:
     """Распарсенная команда."""
     type: CommandType
-    args: list
+    args: List[str]
     raw: str
+    protocol: str = 'TCP'  # 'TCP' или 'UDP'
 
 
 @dataclass
@@ -33,21 +41,44 @@ class Response:
     data: Optional[bytes] = None
 
 
+# Константы TCP
 COMMAND_TERMINATOR = b'\n'
-BUFFER_SIZE = 8192
+BUFFER_SIZE = 1024 * 1024  # 1MB буфер для TCP чтения
 ENCODING = 'utf-8'
 
+# Константы UDP
+# Используем максимально возможный пакет для localhost
+UDP_PACKET_SIZE = 65000
+UDP_HEADER_SIZE = 5
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE
+# Экстремально большое окно, чтобы не было пауз
+UDP_WINDOW_SIZE = 5000
+UDP_TIMEOUT = 2.0
+UDP_RETRY_LIMIT = 20
 
-def parse_command(raw_line: str) -> Command:
+
+def parse_command(raw_line: str, default_proto: str = 'TCP') -> Command:
     """Парсит строку команды в структуру Command."""
     line = raw_line.strip()
     if not line:
-        return Command(CommandType.UNKNOWN, [], raw_line)
-    
-    parts = line.split(maxsplit=1)
+        return Command(CommandType.UNKNOWN, [], raw_line, default_proto)
+
+    parts = line.split()
+    if not parts:
+        return Command(CommandType.UNKNOWN, [], raw_line, default_proto)
+
     cmd_name = parts[0].upper()
-    args = parts[1].split() if len(parts) > 1 else []
-    
+
+    protocol = default_proto
+    clean_args = []
+    for arg in parts[1:]:
+        if arg.lower() == '--udp':
+            protocol = 'UDP'
+        elif arg.lower() == '--tcp':
+            protocol = 'TCP'
+        else:
+            clean_args.append(arg)
+
     command_map = {
         'ECHO': CommandType.ECHO,
         'TIME': CommandType.TIME,
@@ -59,17 +90,17 @@ def parse_command(raw_line: str) -> Command:
         'RESUME_UPLOAD': CommandType.RESUME_UPLOAD,
         'RESUME_DOWNLOAD': CommandType.RESUME_DOWNLOAD,
     }
-    
+
     cmd_type = command_map.get(cmd_name, CommandType.UNKNOWN)
-    
-    # Для ECHO сохраняем весь текст после команды
-    if cmd_type == CommandType.ECHO and len(parts) > 1:
-        args = [parts[1]]
-    
-    return Command(cmd_type, args, raw_line)
+
+    args = clean_args
+    if cmd_type == CommandType.ECHO and clean_args:
+        args = [" ".join(clean_args)]
+
+    return Command(cmd_type, args, raw_line, protocol)
 
 
 def format_response(response: Response) -> bytes:
-    """Форматирует ответ для отправки."""
+    """Форматирует ответ сервера в байты."""
     prefix = "OK" if response.success else "ERROR"
     return f"{prefix} {response.message}\n".encode(ENCODING)
