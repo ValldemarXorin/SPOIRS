@@ -2,8 +2,8 @@
 
 import os
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Any
 from pathlib import Path
 
 
@@ -14,112 +14,119 @@ class TransferSession:
     total_size: int
     transferred: int
     start_time: float
-    client_addr: str
-    is_upload: bool
+    client_id: str  # IP:Port string
+    is_upload: bool # True если клиент загружает НА сервер
     temp_path: Optional[str] = None
+    file_handle: Optional[Any] = None # Открытый файл
+    sock: Optional[Any] = None        # Сокет клиента (для TCP)
+
+    # Для UDP (Sliding Window State)
+    expected_seq: int = 0             # Для приема (Upload)
+    next_seq_num: int = 0             # Для отправки (Download)
+    window_base: int = 0              # База окна
+    last_activity: float = 0.0        # Таймер активности
 
 
 class FileManager:
     """Менеджер файлов сервера."""
-    
+
     def __init__(self, storage_dir: str = "./server_files"):
         self.storage_dir = Path(storage_dir)
         self.temp_dir = self.storage_dir / ".temp"
         self.sessions: Dict[str, TransferSession] = {}
         self._ensure_directories()
-    
+
     def _ensure_directories(self) -> None:
-        """Создаёт необходимые директории."""
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def _sanitize_addr(self, client_addr: str) -> str:
-        """Убирает недопустимые символы из адреса для имени файла."""
-        # Windows не разрешает : в именах файлов
         return client_addr.replace(":", "_")
-    
+
     def get_file_path(self, filename: str) -> Path:
-        """Возвращает полный путь к файлу."""
-        # Защита от path traversal атак
         safe_name = Path(filename).name
         return self.storage_dir / safe_name
-    
+
     def get_temp_path(self, filename: str, client_addr: str) -> Path:
-        """Возвращает путь к временному файлу."""
         safe_name = Path(filename).name
         safe_addr = self._sanitize_addr(client_addr)
         return self.temp_dir / f"{safe_addr}_{safe_name}.tmp"
-    
+
     def file_exists(self, filename: str) -> bool:
-        """Проверяет существование файла."""
         return self.get_file_path(filename).exists()
-    
+
     def get_file_size(self, filename: str) -> int:
-        """Возвращает размер файла."""
         path = self.get_file_path(filename)
         return path.stat().st_size if path.exists() else 0
-    
-    def create_session(self, filename: str, total_size: int, 
-                       client_addr: str, is_upload: bool) -> TransferSession:
-        """Создаёт новую сессию передачи."""
+
+    def create_session(self, filename: str, total_size: int,
+                       client_id: str, is_upload: bool, sock=None) -> TransferSession:
+        """Создаёт и регистрирует новую сессию."""
+        temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
+
         session = TransferSession(
             filename=filename,
             total_size=total_size,
             transferred=0,
             start_time=time.time(),
-            client_addr=client_addr,
+            client_id=client_id,
             is_upload=is_upload,
-            temp_path=str(self.get_temp_path(filename, client_addr))
+            temp_path=temp_path,
+            sock=sock,
+            last_activity=time.time()
         )
-        session_key = self._make_session_key(filename, client_addr)
-        self.sessions[session_key] = session
+
+        # Открываем файл сразу, чтобы не делать это в цикле
+        try:
+            if is_upload:
+                session.file_handle = open(temp_path, 'wb') # Пока без докачки для простоты
+            else:
+                path = self.get_file_path(filename)
+                session.file_handle = open(path, 'rb')
+        except IOError as e:
+            print(f"Error opening file for session: {e}")
+            return None
+
+        self.sessions[client_id] = session
         return session
-    
-    def get_session(self, filename: str, 
-                    client_addr: str) -> Optional[TransferSession]:
-        """Возвращает существующую сессию."""
-        key = self._make_session_key(filename, client_addr)
-        return self.sessions.get(key)
-    
-    def complete_session(self, filename: str, client_addr: str) -> None:
-        """Завершает сессию, перемещая файл из temp."""
-        session = self.get_session(filename, client_addr)
-        if session and session.is_upload and session.temp_path:
-            temp_path = Path(session.temp_path)
-            final_path = self.get_file_path(filename)
-            if temp_path.exists():
-                # Удаляем целевой файл, если существует
-                if final_path.exists():
-                    final_path.unlink()
-                temp_path.rename(final_path)
-        
-        key = self._make_session_key(filename, client_addr)
-        self.sessions.pop(key, None)
-    
-    def remove_session(self, filename: str, client_addr: str) -> None:
-        """Удаляет сессию и временные файлы."""
-        session = self.get_session(filename, client_addr)
-        if session and session.temp_path:
-            temp_path = Path(session.temp_path)
-            if temp_path.exists():
-                temp_path.unlink()
-        
-        key = self._make_session_key(filename, client_addr)
-        self.sessions.pop(key, None)
-    
-    def _make_session_key(self, filename: str, client_addr: str) -> str:
-        """Создаёт уникальный ключ сессии."""
-        return f"{client_addr}:{filename}"
-    
+
+    def get_session(self, client_id: str) -> Optional[TransferSession]:
+        return self.sessions.get(client_id)
+
+    def close_session(self, client_id: str) -> None:
+        """Закрывает дескриптор файла и удаляет сессию."""
+        session = self.sessions.get(client_id)
+        if session and session.file_handle:
+            try:
+                session.file_handle.close()
+            except:
+                pass
+        self.sessions.pop(client_id, None)
+
+    def complete_session(self, client_id: str) -> None:
+        """Успешное завершение сессии (перенос файла)."""
+        session = self.sessions.get(client_id)
+        if session:
+            if session.file_handle:
+                session.file_handle.close()
+                session.file_handle = None
+
+            if session.is_upload and session.temp_path:
+                temp_path = Path(session.temp_path)
+                final_path = self.get_file_path(session.filename)
+                if temp_path.exists():
+                    if final_path.exists():
+                        final_path.unlink()
+                    temp_path.rename(final_path)
+
+            self.sessions.pop(client_id, None)
+
     def calculate_bitrate(self, session: TransferSession) -> float:
-        """Вычисляет скорость передачи в байтах/сек."""
         elapsed = time.time() - session.start_time
-        if elapsed <= 0:
-            return 0.0
+        if elapsed <= 0: return 0.0
         return session.transferred / elapsed
-    
+
     def format_bitrate(self, bitrate: float) -> str:
-        """Форматирует скорость в человекочитаемый вид."""
         if bitrate >= 1024 * 1024:
             return f"{bitrate / (1024 * 1024):.2f} MB/s"
         elif bitrate >= 1024:
