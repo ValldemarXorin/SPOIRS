@@ -4,7 +4,7 @@ import socket
 import struct
 import time
 import select
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Callable
 
 from .protocol import (
     UDP_PAYLOAD_SIZE, UDP_HEADER_SIZE, UDP_WINDOW_SIZE,
@@ -18,10 +18,9 @@ class RUDPSocket:
     def __init__(self, sock: socket.socket, dest_addr: Tuple[str, int] = None):
         self.sock = sock
         self.dest_addr = dest_addr
-        # ВАЖНО: НЕ переводим в неблокирующий режим здесь.
-        # Неблокирующий режим используется ТОЛЬКО через select() + try/except.
-        # setblocking(False) вызывает WinError 10035 при sendto на Windows.
-        self.sock.setblocking(True)  # Блокирующий по умолчанию
+        # Блокирующий режим — неблокирующий доступ только через select() + settimeout()
+        # setblocking(False) вызывает WinError 10035 при sendto на Windows
+        self.sock.setblocking(True)
         try:
             buff_size = 50 * 1024 * 1024
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buff_size)
@@ -41,13 +40,15 @@ class RUDPSocket:
         return seq_num, type_val, packet[UDP_HEADER_SIZE:]
 
     def _sendto_safe(self, data: bytes, addr: tuple) -> bool:
-        """Отправляет пакет с повторными попытками при EAGAIN/WinError 10035."""
+        """
+        Отправляет пакет с повторными попытками при EAGAIN / WinError 10035.
+        Ошибка возникает когда буфер отправки ОС переполнен.
+        """
         for _ in range(50):
             try:
                 self.sock.sendto(data, addr)
                 return True
             except BlockingIOError:
-                # WinError 10035 / EAGAIN: буфер отправки заполнен, ждём
                 time.sleep(0.001)
             except OSError as e:
                 if e.errno in (10035, 11):  # WSAEWOULDBLOCK / EAGAIN
@@ -56,8 +57,12 @@ class RUDPSocket:
                     return False
         return False
 
+    # ------------------------------------------------------------------ #
+    #  Команды                                                             #
+    # ------------------------------------------------------------------ #
+
     def send_command(self, text: str) -> Optional[str]:
-        """Отправляет текстовую команду и ждет ответа."""
+        """Отправляет текстовую команду и ждёт ответа."""
         data = text.encode()
         seq = 0
         pkt = self._pack_packet(seq, PacketType.CMD.value, data)
@@ -113,9 +118,15 @@ class RUDPSocket:
             return msg, addr
         return "", addr
 
-    def send_stream(self, reader, total_size: int) -> None:
+    # ------------------------------------------------------------------ #
+    #  Передача потока данных (скользящее окно)                           #
+    # ------------------------------------------------------------------ #
+
+    def send_stream(self, reader, total_size: int,
+                    progress_callback: Callable[[int], None] = None) -> None:
         """
         Отправка файла со скользящим окном.
+        progress_callback(bytes_sent) вызывается после каждого burst-а.
         Корректно работает на Windows и Linux.
         """
         base = 0
@@ -124,7 +135,7 @@ class RUDPSocket:
         packets: Dict[int, bytes] = {}
         file_cursor = 0
         last_ack_time = time.time()
-        burst_limit = 64  # Пакетов за итерацию до проверки ACK
+        burst_limit = 64  # Пакетов за одну итерацию до проверки ACK
 
         while base * UDP_PAYLOAD_SIZE < total_size:
             # 1. Заполняем окно (Burst send)
@@ -143,8 +154,12 @@ class RUDPSocket:
                 file_cursor += len(chunk)
                 packets_sent += 1
 
-            # 2. Читаем все доступные ACK (неблокирующий select)
-            deadline = time.time() + 0.005  # Максимум 5мс на чтение ACK
+            # Прогресс после burst-а
+            if progress_callback:
+                progress_callback(file_cursor)
+
+            # 2. Читаем все доступные ACK (неблокирующий select, макс 5 мс)
+            deadline = time.time() + 0.005
             while time.time() < deadline:
                 ready = select.select([self.sock], [], [], 0)
                 if not ready[0]:
@@ -173,7 +188,7 @@ class RUDPSocket:
                         self._sendto_safe(packets[seq], self.dest_addr)
                 last_ack_time = time.time()
 
-        # 4. Отправляем FIN (с повторами до получения ACK)
+        # 4. FIN с подтверждением
         fin_pkt = self._pack_packet(next_seq_num, PacketType.FIN.value, b'')
         for _ in range(30):
             if self.dest_addr:
@@ -192,9 +207,12 @@ class RUDPSocket:
                 except socket.error:
                     pass
 
-    def recv_stream(self, writer) -> int:
+    def recv_stream(self, writer, total_size: int = 0,
+                    progress_callback: Callable[[int], None] = None) -> int:
         """
         Приём файла с буферизацией out-of-order пакетов.
+        progress_callback(bytes_received) вызывается после записи каждого пакета.
+        total_size используется только для колбэка (можно передать 0).
         Корректно работает на Windows и Linux.
         """
         expected_seq = 0
@@ -203,18 +221,19 @@ class RUDPSocket:
         last_pkt_time = time.time()
         timeout_limit = 10.0
 
-        ack_interval = 32   # ACK каждые 32 пакета (баланс скорость/надёжность)
+        ack_interval = 32   # ACK каждые 32 пакета
         packets_since_ack = 0
         last_ack_time = time.time()
 
         while True:
+            # Таймаут соединения
             if time.time() - last_pkt_time > timeout_limit:
                 print("RUDP recv timeout")
                 break
 
             ready = select.select([self.sock], [], [], 0.5)
             if not ready[0]:
-                # Периодически шлём ACK чтобы отправитель не завис
+                # Периодически шлём ACK, чтобы отправитель не завис
                 if time.time() - last_ack_time > 0.2 and self.dest_addr:
                     ack = self._pack_packet(expected_seq, PacketType.ACK.value, b'')
                     self._sendto_safe(ack, self.dest_addr)
@@ -250,17 +269,23 @@ class RUDPSocket:
                     total_bytes += len(data)
                     expected_seq += 1
                     packets_since_ack += 1
-                    # Вытаскиваем всё, что пришло раньше срока из буфера
+
+                    # Вытаскиваем из буфера пакеты, пришедшие раньше срока
                     while expected_seq in received_buffer:
                         buf_data = received_buffer.pop(expected_seq)
                         writer.write(buf_data)
                         total_bytes += len(buf_data)
                         expected_seq += 1
                         packets_since_ack += 1
+
+                    # Колбэк прогресса
+                    if progress_callback:
+                        progress_callback(total_bytes)
+
                 elif seq > expected_seq:
                     if seq < expected_seq + UDP_WINDOW_SIZE:
                         received_buffer[seq] = data
-                    # Out-of-order: форсируем ACK немедленно
+                    # Out-of-order: форсируем немедленный ACK
                     packets_since_ack = ack_interval
 
                 # Отправляем ACK по интервалу или по времени
