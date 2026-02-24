@@ -10,7 +10,6 @@ from common.socket_utils import (
     create_client_socket, recv_until,
     recv_exact, send_all
 )
-
 from common.rudp import RUDPSocket
 
 
@@ -35,7 +34,6 @@ class FileTransferClient:
         except Exception:
             pass
 
-        # Progress throttling
         self._progress_last_ts = 0.0
         self._progress_last_percent = -1
 
@@ -203,7 +201,7 @@ class FileTransferClient:
         return self._do_download(filename, offset, use_udp)
 
     def _do_download(self, filename: str, offset: int, use_udp: bool) -> bool:
-        # ВАЖНО: если пользователь ввёл путь (например N:\file.exe), отправляем только имя файла.
+        # если пользователь дал путь N:\..., отправляем только имя
         filename = Path(filename).name
 
         proto_flag = "--udp" if use_udp else "--tcp"
@@ -273,7 +271,7 @@ class FileTransferClient:
 
         return True
 
-    # -------- Helpers -------- #
+    # -------- helpers -------- #
 
     def _parse_file_response(self, response: str) -> int:
         parts = response.split()
@@ -323,7 +321,6 @@ class FileTransferClient:
         percent = int((current / total) * 100)
         now = time.time()
 
-        # печатаем: если завершили, или раз в 0.1с, или изменился процент
         if current == total or (now - self._progress_last_ts) >= 0.1 or percent != self._progress_last_percent:
             print(f"\rProgress: {percent}% ({current}/{total} bytes)", end="", flush=True)
             self._progress_last_ts = now

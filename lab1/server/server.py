@@ -17,44 +17,54 @@ from common.rudp import RUDPSocket
 from server.command_handler import CommandHandler
 from server.file_manager import FileManager
 
-TCP_CHUNK_SIZE = 64 * 1024
+TCP_CHUNK_SIZE = 32 * 1024
 
-# МАКСИМАЛЬНАЯ АГРЕССИЯ UDP
-UDP_BURST_SIZE = 256      # Отправляем 256 пакетов за такт select
-UDP_READ_BATCH = 1024     # Читаем до 1024 пакетов за раз
-UDP_DOWNLOAD_WINDOW = 1024
-UDP_UPLOAD_WINDOW = 1024
+UDP_BURST_SIZE = 64
+UDP_READ_BATCH = 256
+UDP_DOWNLOAD_WINDOW = 512
+UDP_UPLOAD_WINDOW = 2048
 
-UDP_FIN_RESEND_INTERVAL = 0.1
-UDP_FIN_MAX_TRIES = 80
+UDP_FIN_RESEND_INTERVAL = 0.2
+UDP_FIN_MAX_TRIES = 50
+
 
 def _would_block(err: BaseException) -> bool:
     eno = getattr(err, "errno", None)
     return isinstance(err, BlockingIOError) or (eno in (11, 10035))
 
+
 class TCPServer:
+    """Сервер с I/O мультиплексированием."""
+
     def __init__(self, host: str = '0.0.0.0', port: int = 9000):
         self.host = host
         self.port = port
         self.running = False
+
         self.server_socket_tcp: Optional[socket.socket] = None
         self.server_socket_udp: Optional[socket.socket] = None
+
         self.file_manager = FileManager()
         self.command_handler = CommandHandler(self.file_manager)
+
         self.inputs: list = []
         self.outputs: list = []
         self.tcp_buffers: Dict[int, bytes] = {}
+
         self._rudp: Optional[RUDPSocket] = None
+
+    # ---------------- запуск / остановка ---------------- #
 
     def start(self) -> None:
         self._setup_signal_handlers()
+
         self.server_socket_tcp = create_server_socket(self.host, self.port)
         self.server_socket_tcp.setblocking(False)
         self.inputs.append(self.server_socket_tcp)
 
         self.server_socket_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            buff_size = 100 * 1024 * 1024
+            buff_size = 50 * 1024 * 1024
             self.server_socket_udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buff_size)
             self.server_socket_udp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buff_size)
         except Exception:
@@ -63,6 +73,7 @@ class TCPServer:
         self.server_socket_udp.bind((self.host, self.port))
         self.server_socket_udp.setblocking(False)
         self.inputs.append(self.server_socket_udp)
+
         self._rudp = RUDPSocket(self.server_socket_udp)
         self.running = True
 
@@ -73,6 +84,8 @@ class TCPServer:
 
         display_host = real_ip if self.host in ('0.0.0.0', '') else self.host
         print(f"Server started on {display_host}:{self.port}")
+        print(f"Listening on all interfaces (0.0.0.0:{self.port})")
+
         self._main_loop()
 
     def _setup_signal_handlers(self) -> None:
@@ -80,23 +93,32 @@ class TCPServer:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame) -> None:
-        print("\nShutting down...")
+        print("\nShutting down server...")
         self.stop()
         sys.exit(0)
 
     def stop(self) -> None:
         self.running = False
         for s in self.inputs:
-            try: s.close()
-            except Exception: pass
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    # ---------------- вспомогательный UDP send ---------------- #
 
     def _udp_sendto(self, data: bytes, addr: tuple) -> bool:
-        if self.server_socket_udp is None: return False
+        if self.server_socket_udp is None:
+            return False
         try:
             self.server_socket_udp.sendto(data, addr)
             return True
         except (BlockingIOError, OSError) as e:
+            if _would_block(e):
+                return False
             return False
+
+    # ---------------- главный цикл ---------------- #
 
     def _main_loop(self) -> None:
         while self.running:
@@ -112,16 +134,27 @@ class TCPServer:
                 )
 
                 for s in readable:
-                    if s is self.server_socket_tcp: self._handle_tcp_accept()
-                    elif s is self.server_socket_udp: self._handle_udp_read_batch()
-                    else: self._handle_tcp_read(s)
+                    if s is self.server_socket_tcp:
+                        self._handle_tcp_accept()
+                    elif s is self.server_socket_udp:
+                        self._handle_udp_read_batch()
+                    else:
+                        self._handle_tcp_read(s)
 
-                for s in writable: self._handle_tcp_write(s)
-                for s in exceptional: self._remove_client(s)
+                for s in writable:
+                    self._handle_tcp_write(s)
+
+                for s in exceptional:
+                    self._remove_client(s)
+
                 self._process_udp_downloads()
 
-            except socket.error: pass
-            except Exception: pass
+            except socket.error:
+                pass
+            except Exception:
+                pass
+
+    # ---------------- TCP ---------------- #
 
     def _handle_tcp_accept(self) -> None:
         try:
@@ -131,7 +164,8 @@ class TCPServer:
             self.inputs.append(client_sock)
             self.tcp_buffers[client_sock.fileno()] = b""
             send_all(client_sock, b"220 Welcome\n")
-        except Exception: pass
+        except Exception:
+            pass
 
     def _handle_tcp_read(self, sock: socket.socket) -> None:
         client_id = str(sock.fileno())
@@ -143,15 +177,21 @@ class TCPServer:
                 if not chunk:
                     self._remove_client(sock)
                     return
+
                 session.file_handle.write(chunk)
                 session.transferred += len(chunk)
 
                 if session.transferred >= session.total_size:
                     bitrate = self.file_manager.calculate_bitrate(session)
-                    msg = f"Received {session.transferred} bytes. {self.file_manager.format_bitrate(bitrate)}"
+                    msg = (
+                        f"Received {session.transferred} bytes. "
+                        f"{self.file_manager.format_bitrate(bitrate)}"
+                    )
+
                     self.file_manager.complete_session(client_id)
                     send_all(sock, format_response(Response(True, msg)))
                     print(f"TCP Upload finished: {client_id}")
+
             except socket.error:
                 self._remove_client(sock)
             return
@@ -163,26 +203,35 @@ class TCPServer:
                 return
 
             buf = self.tcp_buffers.get(sock.fileno(), b"") + data
+
             if COMMAND_TERMINATOR in buf:
                 line, rest = buf.split(COMMAND_TERMINATOR, 1)
                 self.tcp_buffers[sock.fileno()] = rest
+
                 cmd_str = line.decode('utf-8', errors='ignore')
                 command = parse_command(cmd_str, 'TCP')
                 response = self.command_handler.execute(command, sock, None, None)
 
-                transfer_cmds = (CommandType.UPLOAD, CommandType.DOWNLOAD, CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD)
+                transfer_cmds = (
+                    CommandType.UPLOAD, CommandType.DOWNLOAD,
+                    CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD
+                )
+
                 if command.type in transfer_cmds:
-                    if not response.success: send_all(sock, format_response(response))
+                    if not response.success:
+                        send_all(sock, format_response(response))
                 else:
                     send_all(sock, format_response(response))
             else:
                 self.tcp_buffers[sock.fileno()] = buf
+
         except socket.error:
             self._remove_client(sock)
 
     def _handle_tcp_write(self, sock: socket.socket) -> None:
         client_id = str(sock.fileno())
         session = self.file_manager.get_session(client_id)
+
         if session and not session.is_upload and session.file_handle:
             try:
                 chunk = session.file_handle.read(TCP_CHUNK_SIZE)
@@ -195,34 +244,49 @@ class TCPServer:
             except socket.error:
                 self._remove_client(sock)
 
+    # ---------------- UDP ---------------- #
+
     def _handle_udp_read_batch(self) -> None:
-        if self.server_socket_udp is None or self._rudp is None: return
+        if self.server_socket_udp is None or self._rudp is None:
+            return
+
         rudp = self._rudp
 
         for _ in range(UDP_READ_BATCH):
-            try: pkt, addr = self.server_socket_udp.recvfrom(65536)
-            except (BlockingIOError, socket.error): break
+            try:
+                pkt, addr = self.server_socket_udp.recvfrom(65536)
+            except (BlockingIOError, socket.error):
+                break
 
             client_id = f"{addr[0]}:{addr[1]}"
             seq, p_type, data = rudp._unpack_header(pkt)
 
+            # A. команды
             if p_type == PacketType.CMD.value:
                 ack = rudp._pack_packet(seq, PacketType.CMD.value, b"ACK_CMD")
                 self._udp_sendto(ack, addr)
 
                 msg = data.decode(errors='ignore')
-                if msg.startswith("OK ") or msg.startswith("ERROR "): continue
+                if msg.startswith("OK ") or msg.startswith("ERROR "):
+                    continue
 
                 command = parse_command(msg, 'UDP')
                 response = self.command_handler.execute(command, None, self.server_socket_udp, addr)
 
-                transfer_cmds = (CommandType.UPLOAD, CommandType.DOWNLOAD, CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD)
+                transfer_cmds = (
+                    CommandType.UPLOAD, CommandType.DOWNLOAD,
+                    CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD
+                )
+
                 if command.type in transfer_cmds:
                     if not response.success:
-                        self._udp_sendto(rudp._pack_packet(0, PacketType.CMD.value, format_response(response)), addr)
+                        resp_pkt = rudp._pack_packet(0, PacketType.CMD.value, format_response(response))
+                        self._udp_sendto(resp_pkt, addr)
                 else:
-                    self._udp_sendto(rudp._pack_packet(0, PacketType.CMD.value, format_response(response)), addr)
+                    resp_pkt = rudp._pack_packet(0, PacketType.CMD.value, format_response(response))
+                    self._udp_sendto(resp_pkt, addr)
 
+            # B. DATA (UDP upload)
             elif p_type == PacketType.DATA.value:
                 session = self.file_manager.get_session(client_id)
                 if session and session.is_upload:
@@ -231,7 +295,8 @@ class TCPServer:
                             session.file_handle.write(data)
                             session.transferred += len(data)
                             session.expected_seq += 1
-                        except Exception: pass
+                        except Exception:
+                            pass
 
                         while session.expected_seq in session.udp_recv_buffer:
                             buf = session.udp_recv_buffer.pop(session.expected_seq)
@@ -243,54 +308,78 @@ class TCPServer:
                                 session.udp_recv_buffer[session.expected_seq] = buf
                                 break
 
-                        # АГРЕССИВНАЯ ОПТИМИЗАЦИЯ: Шлем ACK только раз в 32 пакета (снижает флуд ACK-ами на 97%)
-                        if session.expected_seq % 32 == 0:
-                            self._udp_sendto(rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b""), addr)
+                        # ACK примерно раз в 8 пакетов
+                        if session.expected_seq % 8 == 0:
+                            ack_pkt = rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b"")
+                            self._udp_sendto(ack_pkt, addr)
 
                     elif seq > session.expected_seq:
                         if seq < session.expected_seq + UDP_UPLOAD_WINDOW:
                             session.udp_recv_buffer.setdefault(seq, data)
-                        # Если пропуск — шлём ACK сразу для Fast Retransmit
-                        self._udp_sendto(rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b""), addr)
+                        # пропуск – форсим ACK
+                        ack_pkt = rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b"")
+                        self._udp_sendto(ack_pkt, addr)
 
+            # C. FIN (конец UDP upload)
             elif p_type == PacketType.FIN.value:
                 session = self.file_manager.get_session(client_id)
                 if session and session.is_upload:
                     if seq == session.expected_seq:
                         ack = rudp._pack_packet(seq + 1, PacketType.ACK.value, b"")
-                        for _ in range(3): self._udp_sendto(ack, addr)
+                        for _ in range(3):
+                            self._udp_sendto(ack, addr)
+
                         bitrate = self.file_manager.calculate_bitrate(session)
-                        print(f"UDP Upload finished: {client_id} — {self.file_manager.format_bitrate(bitrate)}")
+                        print(
+                            f"UDP Upload finished: {client_id} — "
+                            f"{self.file_manager.format_bitrate(bitrate)}"
+                        )
                         self.file_manager.complete_session(client_id)
                     else:
-                        self._udp_sendto(rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b""), addr)
+                        ack = rudp._pack_packet(session.expected_seq, PacketType.ACK.value, b"")
+                        self._udp_sendto(ack, addr)
 
+            # D. ACK (UDP download)
             elif p_type == PacketType.ACK.value:
                 session = self.file_manager.get_session(client_id)
-                if not session or session.is_upload or session.sock is not None: continue
+                if not session or session.is_upload or session.sock is not None:
+                    continue
 
-                session.last_activity = time.time()
+                now = time.time()
+                session.last_activity = now
                 ack_seq = seq
 
                 if session.udp_fin_sent and ack_seq == session.udp_fin_seq + 1:
                     session.udp_fin_acked = True
                     continue
 
-                if session.window_base <= ack_seq <= session.next_seq_num:
+                if ack_seq < session.window_base:
+                    continue
+
+                if ack_seq > session.next_seq_num:
+                    ack_seq = session.next_seq_num
+
+                if ack_seq > session.window_base:
                     for s in range(session.window_base, ack_seq):
                         session.udp_packets.pop(s, None)
+
                     session.window_base = ack_seq
-                    session.udp_last_ack_time = time.time()
+                    session.udp_last_ack_time = now
 
     def _process_udp_downloads(self) -> None:
-        if self.server_socket_udp is None or self._rudp is None: return
+        if self.server_socket_udp is None or self._rudp is None:
+            return
+
         rudp = self._rudp
         now = time.time()
         window_size = min(UDP_WINDOW_SIZE, UDP_DOWNLOAD_WINDOW)
 
         for client_id, session in list(self.file_manager.sessions.items()):
-            if session.is_upload or session.sock is not None or not session.file_handle:
-                if not session.file_handle: self.file_manager.close_session(client_id)
+            if session.is_upload or session.sock is not None:
+                continue
+
+            if not session.file_handle:
+                self.file_manager.close_session(client_id)
                 continue
 
             try:
@@ -300,28 +389,40 @@ class TCPServer:
                 self.file_manager.close_session(client_id)
                 continue
 
-            if session.udp_last_ack_time == 0.0: session.udp_last_ack_time = now
+            if session.udp_last_ack_time == 0.0:
+                session.udp_last_ack_time = now
 
+            # FIN stage
             if session.udp_eof and session.window_base >= session.next_seq_num:
                 if not session.udp_fin_sent:
-                    session.udp_fin_sent, session.udp_fin_seq = True, session.next_seq_num
-                    session.udp_last_fin_time, session.udp_fin_tries = 0.0, 0
+                    session.udp_fin_sent = True
+                    session.udp_fin_seq = session.next_seq_num
+                    session.udp_last_fin_time = 0.0
+                    session.udp_fin_tries = 0
 
                 if session.udp_fin_acked:
                     bitrate = self.file_manager.calculate_bitrate(session)
-                    print(f"UDP Download finished: {client_id} — {self.file_manager.format_bitrate(bitrate)}")
+                    print(
+                        f"UDP Download finished: {client_id} — "
+                        f"{self.file_manager.format_bitrate(bitrate)}"
+                    )
                     self.file_manager.complete_session(client_id)
                     continue
 
                 if (now - session.udp_last_fin_time) >= UDP_FIN_RESEND_INTERVAL:
-                    if self._udp_sendto(rudp._pack_packet(session.udp_fin_seq, PacketType.FIN.value, b""), addr):
+                    fin_pkt = rudp._pack_packet(session.udp_fin_seq, PacketType.FIN.value, b"")
+                    sent = self._udp_sendto(fin_pkt, addr)
+                    if sent:
                         session.udp_last_fin_time = now
                         session.udp_fin_tries += 1
+
                     if session.udp_fin_tries >= UDP_FIN_MAX_TRIES:
                         print(f"UDP Download FIN timeout: {client_id}")
                         self.file_manager.close_session(client_id)
+
                 continue
 
+            # send new data
             burst_left = UDP_BURST_SIZE
             while burst_left > 0 and session.next_seq_num < session.window_base + window_size:
                 if session.transferred >= session.total_size:
@@ -333,17 +434,23 @@ class TCPServer:
                     session.udp_eof = True
                     break
 
-                try: chunk = session.file_handle.read(to_read)
-                except Exception: chunk = b""
+                try:
+                    chunk = session.file_handle.read(to_read)
+                except Exception:
+                    chunk = b""
 
                 if not chunk:
                     session.udp_eof = True
                     break
 
                 pkt = rudp._pack_packet(session.next_seq_num, PacketType.DATA.value, chunk)
-                if not self._udp_sendto(pkt, addr):
-                    try: session.file_handle.seek(-len(chunk), 1)
-                    except Exception: pass
+
+                sent = self._udp_sendto(pkt, addr)
+                if not sent:
+                    try:
+                        session.file_handle.seek(-len(chunk), 1)
+                    except Exception:
+                        pass
                     break
 
                 session.udp_packets[session.next_seq_num] = pkt
@@ -356,17 +463,31 @@ class TCPServer:
                 resent = 0
                 for s in range(session.window_base, session.next_seq_num):
                     pkt = session.udp_packets.get(s)
-                    if pkt and self._udp_sendto(pkt, addr):
-                        resent += 1
-                        if resent >= UDP_BURST_SIZE: break
-                    else:
+                    if not pkt:
+                        continue
+
+                    if not self._udp_sendto(pkt, addr):
                         break
+
+                    resent += 1
+                    if resent >= UDP_BURST_SIZE:
+                        break
+
                 session.udp_last_ack_time = now
 
+    # ---------------- service ---------------- #
+
     def _remove_client(self, sock: socket.socket) -> None:
-        if sock in self.inputs: self.inputs.remove(sock)
-        if sock in self.outputs: self.outputs.remove(sock)
-        if sock.fileno() in self.tcp_buffers: del self.tcp_buffers[sock.fileno()]
+        if sock in self.inputs:
+            self.inputs.remove(sock)
+        if sock in self.outputs:
+            self.outputs.remove(sock)
+        if sock.fileno() in self.tcp_buffers:
+            del self.tcp_buffers[sock.fileno()]
+
         self.file_manager.close_session(str(sock.fileno()))
-        try: sock.close()
-        except Exception: pass
+
+        try:
+            sock.close()
+        except Exception:
+            pass
