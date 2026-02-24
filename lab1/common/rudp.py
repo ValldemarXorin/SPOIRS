@@ -11,7 +11,6 @@ from .protocol import (
     UDP_TIMEOUT, PacketType, UDP_RETRY_LIMIT
 )
 
-
 class RUDPSocket:
     """Класс-обертка для реализации Reliable UDP (скользящее окно)."""
 
@@ -19,7 +18,7 @@ class RUDPSocket:
         self.sock = sock
         self.dest_addr = dest_addr
         try:
-            buff_size = 50 * 1024 * 1024
+            buff_size = 100 * 1024 * 1024
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buff_size)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buff_size)
         except socket.error:
@@ -35,15 +34,16 @@ class RUDPSocket:
         return seq_num, type_val, packet[UDP_HEADER_SIZE:]
 
     def _sendto_safe(self, data: bytes, addr: tuple) -> bool:
-        for _ in range(50):
+        # Убраны медленные time.sleep(0.001)
+        for _ in range(10):
             try:
                 self.sock.sendto(data, addr)
                 return True
             except BlockingIOError:
-                time.sleep(0.001)
+                pass
             except OSError as e:
-                if e.errno in (10035, 11):
-                    time.sleep(0.001)
+                if getattr(e, 'errno', None) in (11, 10035):
+                    pass
                 else:
                     return False
         return False
@@ -61,7 +61,8 @@ class RUDPSocket:
                 self._sendto_safe(pkt, self.dest_addr)
 
             start_wait = time.time()
-            wait_time = 2.0 if ack_received else 0.5
+            wait_time = 1.0 if ack_received else 0.2
+
             while time.time() - start_wait < wait_time:
                 ready = select.select([self.sock], [], [], 0.05)
                 if not ready[0]:
@@ -70,12 +71,13 @@ class RUDPSocket:
                     resp_pkt, addr = self.sock.recvfrom(65536)
                 except (socket.timeout, BlockingIOError, OSError):
                     break
-                if self.dest_addr and addr != self.dest_addr:
-                    continue
+
+                if self.dest_addr and addr != self.dest_addr: continue
                 _, r_type, r_data = self._unpack_header(resp_pkt)
-                if r_type != PacketType.CMD.value:
-                    continue
+
+                if r_type != PacketType.CMD.value: continue
                 decoded = r_data.decode(errors="ignore")
+
                 if decoded == "ACK_CMD":
                     ack_received = True
                     continue
@@ -91,8 +93,8 @@ class RUDPSocket:
         seq, p_type, data = self._unpack_header(pkt)
         if p_type != PacketType.CMD.value:
             return "", addr
-
         msg = data.decode(errors="ignore")
+
         if msg.startswith("OK ") or msg.startswith("ERROR "):
             return "", addr
 
@@ -102,22 +104,16 @@ class RUDPSocket:
 
     # ---------------- Передача потока (скользящее окно) ---------------- #
 
-    def send_stream(self, reader, total_size: int,
-                    progress_callback: Callable[[int], None] = None) -> None:
-        """
-        Отправка файла со скользящим окном.
-        Цикл завершается, когда:
-          - все байты прочитаны/отправлены
-          - все пакеты подтверждены (base >= next_seq_num)
-        Затем отправляется FIN, ожидается FIN-ACK.
-        """
+    def send_stream(self, reader, total_size: int, progress_callback: Callable[[int], None] = None) -> None:
         base = 0
         next_seq_num = 0
         window_size = UDP_WINDOW_SIZE
         packets: Dict[int, bytes] = {}
         file_cursor = 0
         last_ack_time = time.time()
-        burst_limit = 32
+
+        # АГРЕССИВНАЯ ОТПРАВКА: 256 пакетов за такт
+        burst_limit = 256
 
         try:
             self.sock.setblocking(True)
@@ -126,69 +122,62 @@ class RUDPSocket:
             pass
 
         while file_cursor < total_size or base < next_seq_num:
-            # 1. Заполняем окно новыми пакетами
             packets_sent = 0
             while (next_seq_num < base + window_size and
-                   file_cursor < total_size and
-                   packets_sent < burst_limit):
+                   file_cursor < total_size and packets_sent < burst_limit):
                 chunk = reader.read(UDP_PAYLOAD_SIZE)
                 if not chunk:
                     file_cursor = total_size
                     break
+
                 pkt = self._pack_packet(next_seq_num, PacketType.DATA.value, chunk)
                 packets[next_seq_num] = pkt
                 if self.dest_addr:
                     self._sendto_safe(pkt, self.dest_addr)
+
                 next_seq_num += 1
                 file_cursor += len(chunk)
                 packets_sent += 1
+                if progress_callback: progress_callback(file_cursor)
 
-            if progress_callback:
-                progress_callback(file_cursor)
-
-            # 2. Читаем ACK-и (до 15 мс)
-            deadline = time.time() + 0.015
+            # Читаем ACK (очень короткий блок, чтобы не тормозить отправку)
+            deadline = time.time() + 0.005
             while time.time() < deadline:
                 ready = select.select([self.sock], [], [], 0)
-                if not ready[0]:
-                    break
+                if not ready[0]: break
                 try:
                     self.sock.settimeout(0.002)
                     ack_pkt, addr = self.sock.recvfrom(1024)
-                except (socket.timeout, BlockingIOError):
-                    self.sock.settimeout(None)
-                    break
-                except socket.error:
+                except (socket.timeout, BlockingIOError, OSError):
                     self.sock.settimeout(None)
                     break
                 finally:
                     self.sock.settimeout(None)
 
-                if self.dest_addr and addr != self.dest_addr:
-                    continue
+                if self.dest_addr and addr != self.dest_addr: continue
                 ack_seq, p_type, _ = self._unpack_header(ack_pkt)
+
                 if p_type == PacketType.ACK.value and ack_seq > base:
-                    for i in range(base, ack_seq):
-                        packets.pop(i, None)
+                    for i in range(base, ack_seq): packets.pop(i, None)
                     base = ack_seq
                     last_ack_time = time.time()
 
-            # 3. Ретрансмиссия при таймауте
             if time.time() - last_ack_time > UDP_TIMEOUT and self.dest_addr:
+                resent = 0
                 for seq_r in range(base, next_seq_num):
                     if seq_r in packets:
                         self._sendto_safe(packets[seq_r], self.dest_addr)
+                        resent += 1
+                        if resent >= burst_limit: break
                 last_ack_time = time.time()
 
-        # 4. FIN
         if self.dest_addr:
             fin_seq = next_seq_num
             fin_pkt = self._pack_packet(fin_seq, PacketType.FIN.value, b"")
             for _ in range(20):
                 self._sendto_safe(fin_pkt, self.dest_addr)
                 ready = select.select([self.sock], [], [], 0.2)
-                if not ready[0]:
-                    continue
+                if not ready[0]: continue
                 try:
                     self.sock.settimeout(0.2)
                     ack_pkt, addr = self.sock.recvfrom(1024)
@@ -197,21 +186,20 @@ class RUDPSocket:
                     continue
                 finally:
                     self.sock.settimeout(None)
-                if self.dest_addr and addr != self.dest_addr:
-                    continue
-                ack_seq, p_type, _ = self._unpack_header(ack_pkt)
-                if p_type == PacketType.ACK.value and ack_seq == fin_seq + 1:
-                    break
 
-    def recv_stream(self, writer, total_size: int = 0,
-                    progress_callback: Callable[[int], None] = None) -> int:
-        """Приём файла с буферизацией out-of-order пакетов."""
+                if self.dest_addr and addr != self.dest_addr: continue
+                ack_seq, p_type, _ = self._unpack_header(ack_pkt)
+                if p_type == PacketType.ACK.value and ack_seq == fin_seq + 1: break
+
+    def recv_stream(self, writer, total_size: int = 0, progress_callback: Callable[[int], None] = None) -> int:
         expected_seq = 0
         received_buffer: Dict[int, bytes] = {}
         total_bytes = 0
         last_pkt_time = time.time()
         timeout_limit = 60.0
-        ack_interval = 8
+
+        # Cumulative ACK (шлем 1 раз на 32 пакета)
+        ack_interval = 32
         packets_since_ack = 0
         last_ack_time = time.time()
 
@@ -223,44 +211,36 @@ class RUDPSocket:
 
         while True:
             if time.time() - last_pkt_time > timeout_limit:
-                print("RUDP recv timeout")
+                print("\nRUDP recv timeout")
                 break
 
             ready = select.select([self.sock], [], [], 0.5)
             if not ready[0]:
                 if time.time() - last_ack_time > 0.2 and self.dest_addr:
-                    ack = self._pack_packet(expected_seq, PacketType.ACK.value, b"")
-                    self._sendto_safe(ack, self.dest_addr)
+                    self._sendto_safe(self._pack_packet(expected_seq, PacketType.ACK.value, b""), self.dest_addr)
                     last_ack_time = time.time()
                 continue
 
             try:
                 self.sock.settimeout(0.5)
                 pkt, addr = self.sock.recvfrom(65536)
-            except (socket.timeout, BlockingIOError):
+            except (socket.timeout, BlockingIOError, OSError):
                 self.sock.settimeout(None)
                 continue
-            except socket.error:
-                self.sock.settimeout(None)
-                break
             finally:
                 self.sock.settimeout(None)
 
-            if self.dest_addr is None:
-                self.dest_addr = addr
-            elif addr != self.dest_addr:
-                continue
+            if self.dest_addr is None: self.dest_addr = addr
+            elif addr != self.dest_addr: continue
 
             seq, p_type, data = self._unpack_header(pkt)
             last_pkt_time = time.time()
 
             if p_type == PacketType.FIN.value:
-                ack = self._pack_packet(seq + 1, PacketType.ACK.value, b"")
-                self._sendto_safe(ack, addr)
+                self._sendto_safe(self._pack_packet(seq + 1, PacketType.ACK.value, b""), addr)
                 break
 
-            if p_type != PacketType.DATA.value:
-                continue
+            if p_type != PacketType.DATA.value: continue
 
             if seq == expected_seq:
                 writer.write(data)
@@ -275,18 +255,17 @@ class RUDPSocket:
                     expected_seq += 1
                     packets_since_ack += 1
 
-                if progress_callback:
-                    progress_callback(total_bytes)
+                if progress_callback: progress_callback(total_bytes)
 
             elif seq > expected_seq:
                 if seq < expected_seq + UDP_WINDOW_SIZE:
                     received_buffer[seq] = data
+                # Пропуск пакета = форсируем ACK
                 packets_since_ack = ack_interval
 
             now = time.time()
             if packets_since_ack >= ack_interval or (now - last_ack_time > 0.05):
-                ack = self._pack_packet(expected_seq, PacketType.ACK.value, b"")
-                self._sendto_safe(ack, addr)
+                self._sendto_safe(self._pack_packet(expected_seq, PacketType.ACK.value, b""), addr)
                 packets_since_ack = 0
                 last_ack_time = now
 
