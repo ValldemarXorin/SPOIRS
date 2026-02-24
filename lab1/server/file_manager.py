@@ -1,44 +1,46 @@
 """Управление файлами и сессиями передачи."""
 
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 from pathlib import Path
 
+
 @dataclass
 class TransferSession:
     """Информация о сессии передачи файла."""
+
     filename: str
     total_size: int
     transferred: int
     start_time: float
     client_id: str  # IP:Port string
     is_upload: bool  # True если клиент загружает НА сервер
+
     temp_path: Optional[str] = None
     file_handle: Optional[Any] = None  # Открытый файл
     sock: Optional[Any] = None  # Сокет клиента (для TCP)
 
-    # Для UDP Upload (Server receive)
+    # UDP upload (server receive)
     expected_seq: int = 0
+    udp_recv_buffer: Dict[int, bytes] = field(default_factory=dict)
 
-    # Для UDP Download (Server send / Sliding Window)
-    next_seq_num: int = 0           # Следующий порядковый номер для отправки
-    window_base: int = 0            # База окна (подтвержденный seq)
-
-    # Буфер отправленных, но не подтвержденных пакетов: seq -> bytes
+    # UDP download (server send)
+    next_seq_num: int = 0
+    window_base: int = 0
     udp_packets: Dict[int, bytes] = field(default_factory=dict)
+    udp_eof: bool = False
+    udp_last_ack_time: float = 0.0
 
-    udp_last_ack_time: float = 0.0  # Время последнего ACK или отправки
-    udp_eof: bool = False           # Флаг: файл прочитан до конца
-
-    # Состояние отправки FIN
+    # FIN state (download)
     udp_fin_sent: bool = False
     udp_fin_seq: int = 0
     udp_fin_acked: bool = False
     udp_last_fin_time: float = 0.0
     udp_fin_tries: int = 0
-    last_activity: float = 0.0      # Общий таймер активности
+
+    last_activity: float = 0.0
+
 
 class FileManager:
     """Менеджер файлов сервера."""
@@ -75,6 +77,7 @@ class FileManager:
     def create_session(self, filename: str, total_size: int,
                        client_id: str, is_upload: bool, sock=None) -> Optional[TransferSession]:
         """Создаёт и регистрирует новую сессию."""
+
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
 
         session = TransferSession(
@@ -87,12 +90,13 @@ class FileManager:
             temp_path=temp_path,
             sock=sock,
             last_activity=time.time(),
-            udp_last_ack_time=time.time()
+            udp_last_ack_time=time.time(),
         )
 
-        # Открываем файл сразу
+        # Открываем файл сразу, чтобы не делать это в цикле
         try:
             if is_upload:
+                # Пока без докачки/резюма на сервере (для простоты)
                 session.file_handle = open(temp_path, 'wb')
             else:
                 path = self.get_file_path(filename)
@@ -109,40 +113,49 @@ class FileManager:
 
     def close_session(self, client_id: str) -> None:
         """Закрывает дескриптор файла и удаляет сессию."""
+
         session = self.sessions.get(client_id)
         if session and session.file_handle:
             try:
                 session.file_handle.close()
-            except:
+            except Exception:
                 pass
+
         self.sessions.pop(client_id, None)
 
     def complete_session(self, client_id: str) -> None:
         """Успешное завершение сессии (перенос файла)."""
+
         session = self.sessions.get(client_id)
-        if session:
-            if session.file_handle:
+        if not session:
+            return
+
+        if session.file_handle:
+            try:
                 session.file_handle.close()
-                session.file_handle = None
+            except Exception:
+                pass
+            session.file_handle = None
 
-            if session.is_upload and session.temp_path:
-                temp_path = Path(session.temp_path)
-                final_path = self.get_file_path(session.filename)
-                if temp_path.exists():
-                    if final_path.exists():
-                        final_path.unlink()
-                    temp_path.rename(final_path)
+        if session.is_upload and session.temp_path:
+            temp_path = Path(session.temp_path)
+            final_path = self.get_file_path(session.filename)
+            if temp_path.exists():
+                if final_path.exists():
+                    final_path.unlink()
+                temp_path.rename(final_path)
 
-            self.sessions.pop(client_id, None)
+        self.sessions.pop(client_id, None)
 
     def calculate_bitrate(self, session: TransferSession) -> float:
         elapsed = time.time() - session.start_time
-        if elapsed <= 0: return 0.0
+        if elapsed <= 0:
+            return 0.0
         return session.transferred / elapsed
 
     def format_bitrate(self, bitrate: float) -> str:
         if bitrate >= 1024 * 1024:
             return f"{bitrate / (1024 * 1024):.2f} MB/s"
-        elif bitrate >= 1024:
+        if bitrate >= 1024:
             return f"{bitrate / 1024:.2f} KB/s"
         return f"{bitrate:.2f} B/s"

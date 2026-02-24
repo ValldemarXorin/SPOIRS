@@ -1,4 +1,5 @@
 """Протокол обмена сообщениями между клиентом и сервером."""
+
 from dataclasses import dataclass
 from typing import Optional, List
 from enum import Enum
@@ -6,6 +7,7 @@ from enum import Enum
 
 class CommandType(Enum):
     """Типы поддерживаемых команд."""
+
     ECHO = 1
     TIME = 2
     QUIT = 3
@@ -18,6 +20,7 @@ class CommandType(Enum):
 
 class PacketType(Enum):
     """Типы пакетов RUDP."""
+
     DATA = 0
     ACK = 1
     FIN = 2
@@ -27,6 +30,7 @@ class PacketType(Enum):
 @dataclass
 class Command:
     """Распарсенная команда."""
+
     type: CommandType
     args: List[str]
     raw: str
@@ -36,6 +40,7 @@ class Command:
 @dataclass
 class Response:
     """Ответ сервера."""
+
     success: bool
     message: str
     data: Optional[bytes] = None
@@ -46,19 +51,27 @@ COMMAND_TERMINATOR = b'\n'
 BUFFER_SIZE = 1024 * 1024  # 1MB буфер для TCP чтения
 ENCODING = 'utf-8'
 
+
 # Константы UDP
-# Используем максимально возможный пакет для localhost
-UDP_PACKET_SIZE = 65000
+# ВАЖНО: 65000 подходит только для localhost. В реальной сети это приводит к IP-фрагментации
+# и массовым потерям/ретрансмитам. Делаем MTU-friendly размер.
+UDP_PACKET_SIZE = 1400
 UDP_HEADER_SIZE = 5
 UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE
-# Экстремально большое окно, чтобы не было пауз
-UDP_WINDOW_SIZE = 5000
-UDP_TIMEOUT = 2.0
-UDP_RETRY_LIMIT = 20
+
+# Размер окна (пакеты), умеренный для скорости/стабильности
+UDP_WINDOW_SIZE = 512
+
+# Таймаут ретрансмитов (сек.)
+UDP_TIMEOUT = 0.4
+
+# Повторы для команд (CMD)
+UDP_RETRY_LIMIT = 40
 
 
 def parse_command(raw_line: str, default_proto: str = 'TCP') -> Command:
     """Парсит строку команды в структуру Command."""
+
     line = raw_line.strip()
     if not line:
         return Command(CommandType.UNKNOWN, [], raw_line, default_proto)
@@ -68,9 +81,9 @@ def parse_command(raw_line: str, default_proto: str = 'TCP') -> Command:
         return Command(CommandType.UNKNOWN, [], raw_line, default_proto)
 
     cmd_name = parts[0].upper()
-
     protocol = default_proto
-    clean_args = []
+
+    clean_args: List[str] = []
     for arg in parts[1:]:
         if arg.lower() == '--udp':
             protocol = 'UDP'
@@ -102,5 +115,6 @@ def parse_command(raw_line: str, default_proto: str = 'TCP') -> Command:
 
 def format_response(response: Response) -> bytes:
     """Форматирует ответ сервера в байты."""
+
     prefix = "OK" if response.success else "ERROR"
     return f"{prefix} {response.message}\n".encode(ENCODING)
