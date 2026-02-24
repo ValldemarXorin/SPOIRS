@@ -26,7 +26,7 @@ class RUDPSocket:
         except socket.error:
             pass
 
-    # ------------ базовые операции над пакетами ------------ #
+    # ------------ базовые операции ------------ #
 
     def _pack_packet(self, seq_num: int, p_type_val: int, data: bytes) -> bytes:
         return struct.pack('!IB', seq_num, p_type_val) + data
@@ -38,7 +38,6 @@ class RUDPSocket:
         return seq_num, type_val, packet[UDP_HEADER_SIZE:]
 
     def _sendto_safe(self, data: bytes, addr: tuple) -> bool:
-        """Отправка с несколькими быстрыми ретраями без sleep()."""
         for _ in range(10):
             try:
                 self.sock.sendto(data, addr)
@@ -109,7 +108,7 @@ class RUDPSocket:
         self._sendto_safe(resp, addr)
         return msg, addr
 
-    # --------------- передача потока (send) --------------- #
+    # --------------- send_stream --------------- #
 
     def send_stream(
         self,
@@ -124,7 +123,7 @@ class RUDPSocket:
         file_cursor = 0
         last_ack_time = time.time()
 
-        burst_limit = 64  # сколько пакетов шлём за одну итерацию
+        burst_limit = 64
 
         try:
             self.sock.setblocking(True)
@@ -133,7 +132,6 @@ class RUDPSocket:
             pass
 
         while file_cursor < total_size or base < next_seq_num:
-            # 1) отправка новых пакетов в пределах окна
             packets_sent = 0
             while (
                 next_seq_num < base + window_size
@@ -158,7 +156,6 @@ class RUDPSocket:
                 if progress_callback:
                     progress_callback(file_cursor)
 
-            # 2) обработка ACK (короткий non‑blocking цикл)
             deadline = time.time() + 0.01
             while time.time() < deadline:
                 ready = select.select([self.sock], [], [], 0)
@@ -184,7 +181,6 @@ class RUDPSocket:
                     base = ack_seq
                     last_ack_time = time.time()
 
-            # 3) ретрансмит при таймауте
             if time.time() - last_ack_time > UDP_TIMEOUT and self.dest_addr:
                 resent = 0
                 for seq_r in range(base, next_seq_num):
@@ -195,7 +191,7 @@ class RUDPSocket:
                             break
                 last_ack_time = time.time()
 
-        # 4) FIN / FIN‑ACK
+        # FIN + FIN‑ACK (если ACK не пришёл, просто выходим — клиент уже всё отправил)
         if self.dest_addr:
             fin_seq = next_seq_num
             fin_pkt = self._pack_packet(fin_seq, PacketType.FIN.value, b"")
@@ -204,7 +200,6 @@ class RUDPSocket:
                 ready = select.select([self.sock], [], [], 0.2)
                 if not ready[0]:
                     continue
-
                 try:
                     self.sock.settimeout(0.2)
                     ack_pkt, addr = self.sock.recvfrom(1024)
@@ -220,8 +215,9 @@ class RUDPSocket:
                 ack_seq, p_type, _ = self._unpack_header(ack_pkt)
                 if p_type == PacketType.ACK.value and ack_seq == fin_seq + 1:
                     break
+        # выходим в любом случае — иначе клиент будет висеть
 
-    # --------------- приём потока (recv) --------------- #
+    # --------------- recv_stream --------------- #
 
     def recv_stream(
         self,
@@ -235,7 +231,7 @@ class RUDPSocket:
         last_pkt_time = time.time()
         timeout_limit = 60.0
 
-        ack_interval = 8         # ACK примерно на каждые 8 пакетов
+        ack_interval = 8
         packets_since_ack = 0
         last_ack_time = time.time()
 
@@ -252,7 +248,6 @@ class RUDPSocket:
 
             ready = select.select([self.sock], [], [], 0.5)
             if not ready[0]:
-                # периодический ACK, чтобы не стопорить окно
                 if time.time() - last_ack_time > 0.2 and self.dest_addr:
                     ack = self._pack_packet(expected_seq, PacketType.ACK.value, b"")
                     self._sendto_safe(ack, self.dest_addr)
@@ -303,7 +298,6 @@ class RUDPSocket:
             elif seq > expected_seq:
                 if seq < expected_seq + UDP_WINDOW_SIZE:
                     received_buffer[seq] = data
-                # пропуск – форсим быстрый ACK
                 packets_since_ack = ack_interval
 
             now = time.time()
