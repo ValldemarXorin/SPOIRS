@@ -1,10 +1,9 @@
 """TCP/UDP клиент для работы с сервером."""
 
 import socket
-import os
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple
 
 from common.protocol import COMMAND_TERMINATOR, BUFFER_SIZE
 from common.socket_utils import (
@@ -20,11 +19,14 @@ class FileTransferClient:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
+
         self.tcp_socket: Optional[socket.socket] = None
         self.connected = False
+
         self.download_dir = Path("./downloads")
         self.download_dir.mkdir(exist_ok=True)
 
+        # UDP Socket init
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             buff_size = 50 * 1024 * 1024
@@ -39,6 +41,7 @@ class FileTransferClient:
             self.tcp_socket = create_client_socket()
             self.tcp_socket.connect((self.host, self.port))
             self.connected = True
+
             welcome = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
             if welcome:
                 print(welcome.decode().strip())
@@ -50,18 +53,30 @@ class FileTransferClient:
     def disconnect(self) -> None:
         """Закрывает соединение."""
         if self.tcp_socket:
-            self.send_command("QUIT")
-            self.tcp_socket.close()
+            try:
+                self.send_command("QUIT")
+            except Exception:
+                pass
+            try:
+                self.tcp_socket.close()
+            except Exception:
+                pass
+
         self.connected = False
-        self.udp_socket.close()
+        try:
+            self.udp_socket.close()
+        except Exception:
+            pass
 
     def send_command(self, command: str, proto: str = 'TCP') -> Optional[str]:
         """Отправляет команду и получает ответ."""
         if proto == 'UDP':
             rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
             return rudp.send_command(command)
+
         if not self.connected:
             return None
+
         try:
             send_all(self.tcp_socket, (command + "\n").encode())
             response = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
@@ -70,12 +85,15 @@ class FileTransferClient:
             print(f"Command failed: {e}")
             return None
 
+    # ----------------------- Upload ----------------------- #
+
     def upload_file(self, filepath: str, use_udp: bool = False) -> bool:
         """Загружает файл на сервер."""
         path = Path(filepath)
         if not path.exists():
             print(f"File not found: {filepath}")
             return False
+
         filename = path.name
         file_size = path.stat().st_size
         return self._do_upload(path, filename, file_size, offset=0, use_udp=use_udp)
@@ -86,6 +104,7 @@ class FileTransferClient:
         if not path.exists():
             print(f"File not found: {filepath}")
             return False
+
         filename = path.name
         file_size = path.stat().st_size
         remaining = file_size - offset
@@ -95,14 +114,16 @@ class FileTransferClient:
                    size: int, offset: int, use_udp: bool = False) -> bool:
         """Выполняет загрузку файла."""
         proto_flag = "--udp" if use_udp else "--tcp"
+
         if offset > 0:
             command = f"RESUME_UPLOAD {filename} {offset} {size} {proto_flag}"
         else:
             command = f"UPLOAD {filename} {size} {proto_flag}"
 
+        # 1. Инициализация сессии на сервере (READY)
         if use_udp:
-            rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
-            response = rudp.send_command(command)
+            rudp_cmd = RUDPSocket(self.udp_socket, (self.host, self.port))
+            response = rudp_cmd.send_command(command)
             if not response or "READY" not in response:
                 print(f"Server not ready (UDP): {response}")
                 return False
@@ -117,31 +138,37 @@ class FileTransferClient:
         print(f"Starting Upload via {'UDP' if use_udp else 'TCP'}...")
         start_time = time.time()
 
+        # 2. Передача данных
         if use_udp:
             try:
                 with open(path, 'rb') as f:
                     f.seek(offset)
                     rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
-                    # Передаём колбэк прогресса: current_bytes -> None
+                    # прогресс через колбэк
                     rudp.send_stream(
-                        f, size,
-                        progress_callback=lambda sent: self._print_progress(sent, size)
+                        f,
+                        total_size=size,
+                        progress_callback=lambda sent: self._print_progress(sent, size),
                     )
                 sent = size
             except Exception as e:
                 print(f"UDP Upload error: {e}")
                 sent = 0
+
+            # Для UDP сервер финальный ответ по TCP не шлёт — просто считаем битрейт локально
+            elapsed = time.time() - start_time
+            self._print_stats("Upload", sent, elapsed)
+            return sent == size
+
         else:
             sent = self._send_file_data(path, size, offset)
-
-        # Финальный ответ сервера по TCP
-        final = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
-        if final:
-            print(final.decode().strip())
-
-        elapsed = time.time() - start_time
-        self._print_stats("Upload", sent, elapsed)
-        return sent == size
+            # 3. Финальный ответ по TCP
+            final = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
+            if final:
+                print(final.decode().strip())
+            elapsed = time.time() - start_time
+            self._print_stats("Upload", sent, elapsed)
+            return sent == size
 
     def _send_file_data(self, path: Path, size: int, offset: int) -> int:
         """Отправляет данные файла (TCP)."""
@@ -162,6 +189,8 @@ class FileTransferClient:
             print(f"File read error: {e}")
         return sent
 
+    # ----------------------- Download ----------------------- #
+
     def download_file(self, filename: str, use_udp: bool = False) -> bool:
         """Скачивает файл с сервера."""
         return self._do_download(filename, offset=0, use_udp=use_udp)
@@ -173,15 +202,15 @@ class FileTransferClient:
     def _do_download(self, filename: str, offset: int, use_udp: bool = False) -> bool:
         """Выполняет скачивание файла."""
         proto_flag = "--udp" if use_udp else "--tcp"
+
         if offset > 0:
             command = f"RESUME_DOWNLOAD {filename} {offset} {proto_flag}"
         else:
             command = f"DOWNLOAD {filename} {proto_flag}"
 
-        file_size = 0
         if use_udp:
-            rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
-            response_str = rudp.send_command(command)
+            rudp_cmd = RUDPSocket(self.udp_socket, (self.host, self.port))
+            response_str = rudp_cmd.send_command(command)
             if not response_str:
                 return False
         else:
@@ -208,10 +237,10 @@ class FileTransferClient:
             try:
                 rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
                 with open(filepath, mode) as f:
-                    # Передаём колбэк прогресса: current_bytes -> None
                     received = rudp.recv_stream(
-                        f, total_size=file_size,
-                        progress_callback=lambda recv: self._print_progress(recv, file_size)
+                        f,
+                        total_size=file_size,
+                        progress_callback=lambda rcv: self._print_progress(rcv, file_size),
                     )
             except Exception as e:
                 print(f"UDP Download error: {e}")
@@ -223,6 +252,8 @@ class FileTransferClient:
         self._print_stats("Download", received, elapsed)
         return received == file_size
 
+    # ----------------------- Helpers ----------------------- #
+
     def _parse_file_response(self, response: str) -> int:
         """
         Парсит ответ сервера.
@@ -231,16 +262,21 @@ class FileTransferClient:
           TCP: "FILE <size>"
         """
         parts = response.split()
+
+        # "OK FILE 12345"
         if len(parts) >= 3 and parts[0] == "OK" and parts[1] == "FILE":
             try:
                 return int(parts[2])
             except ValueError:
                 pass
+
+        # "FILE 12345"
         if len(parts) >= 2 and parts[0] == "FILE":
             try:
                 return int(parts[1])
             except ValueError:
                 pass
+
         return 0
 
     def _receive_file_data(self, filename: str, size: int, offset: int) -> int:
@@ -248,6 +284,7 @@ class FileTransferClient:
         filepath = self.download_dir / filename
         mode = 'ab' if offset > 0 else 'wb'
         received = 0
+
         try:
             with open(filepath, mode) as f:
                 while received < size:
@@ -270,7 +307,7 @@ class FileTransferClient:
 
     def _print_stats(self, operation: str, bytes_transferred: int,
                      elapsed: float) -> None:
-        print()  # Перевод строки после прогресса
+        print()  # новая строка после прогресса
         if elapsed > 0:
             bitrate = bytes_transferred / elapsed
             if bitrate >= 1024 * 1024:
@@ -290,17 +327,20 @@ class InteractiveClient:
         self.last_download: Optional[Tuple[str, int, bool]] = None
 
     def run(self) -> None:
-        if not self.client.connect():
-            pass
+        # Пытаемся подключиться по TCP, но даже при неудаче можно использовать UDP-команды
+        self.client.connect()
         self._print_help()
+
         try:
             while True:
                 try:
                     cmd = input("\n> ").strip()
                 except EOFError:
                     break
+
                 if not cmd:
                     continue
+
                 if not self._process_input(cmd):
                     break
         except KeyboardInterrupt:
@@ -310,17 +350,18 @@ class InteractiveClient:
 
     def _print_help(self) -> None:
         print("\nAvailable commands:")
-        print("  ECHO <text> [--udp]   - Echo text")
-        print("  TIME [--udp]          - Get time")
-        print("  UPLOAD <path> [--udp] - Upload file")
-        print("  DOWNLOAD <name> [--udp]- Download file")
-        print("  RESUME                - Resume last transfer")
-        print("  QUIT                  - Disconnect")
+        print("  ECHO <text> [--udp]       - Echo text")
+        print("  TIME [--udp]              - Get time")
+        print("  UPLOAD <path> [--udp]     - Upload file")
+        print("  DOWNLOAD <name> [--udp]   - Download file")
+        print("  RESUME                    - Resume last transfer")
+        print("  QUIT                      - Disconnect")
 
     def _process_input(self, cmd: str) -> bool:
         parts = cmd.split()
         if not parts:
             return True
+
         command = parts[0].upper()
         use_udp = '--udp' in [p.lower() for p in parts]
         args_str = " ".join([p for p in parts[1:] if p.lower() != '--udp'])
@@ -337,15 +378,17 @@ class InteractiveClient:
             response = self.client.send_command(cmd, 'UDP' if use_udp else 'TCP')
             if response:
                 print(response)
-        return True
+            return True
 
     def _handle_upload(self, filepath: str, use_udp: bool) -> bool:
         if not filepath:
             print("Usage: UPLOAD <path> [--udp]")
             return True
+
         if self.client.upload_file(filepath, use_udp):
             self.last_upload = None
         else:
+            # offset пока не считаем — всегда с нуля
             self.last_upload = (filepath, 0, use_udp)
         return True
 
@@ -353,6 +396,7 @@ class InteractiveClient:
         if not filename:
             print("Usage: DOWNLOAD <filename> [--udp]")
             return True
+
         if self.client.download_file(filename, use_udp):
             self.last_download = None
         else:
