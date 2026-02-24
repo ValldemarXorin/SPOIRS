@@ -2,10 +2,9 @@
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 from pathlib import Path
-
 
 @dataclass
 class TransferSession:
@@ -15,17 +14,31 @@ class TransferSession:
     transferred: int
     start_time: float
     client_id: str  # IP:Port string
-    is_upload: bool # True если клиент загружает НА сервер
+    is_upload: bool  # True если клиент загружает НА сервер
     temp_path: Optional[str] = None
-    file_handle: Optional[Any] = None # Открытый файл
-    sock: Optional[Any] = None        # Сокет клиента (для TCP)
+    file_handle: Optional[Any] = None  # Открытый файл
+    sock: Optional[Any] = None  # Сокет клиента (для TCP)
 
-    # Для UDP (Sliding Window State)
-    expected_seq: int = 0             # Для приема (Upload)
-    next_seq_num: int = 0             # Для отправки (Download)
-    window_base: int = 0              # База окна
-    last_activity: float = 0.0        # Таймер активности
+    # Для UDP Upload (Server receive)
+    expected_seq: int = 0
 
+    # Для UDP Download (Server send / Sliding Window)
+    next_seq_num: int = 0           # Следующий порядковый номер для отправки
+    window_base: int = 0            # База окна (подтвержденный seq)
+
+    # Буфер отправленных, но не подтвержденных пакетов: seq -> bytes
+    udp_packets: Dict[int, bytes] = field(default_factory=dict)
+
+    udp_last_ack_time: float = 0.0  # Время последнего ACK или отправки
+    udp_eof: bool = False           # Флаг: файл прочитан до конца
+
+    # Состояние отправки FIN
+    udp_fin_sent: bool = False
+    udp_fin_seq: int = 0
+    udp_fin_acked: bool = False
+    udp_last_fin_time: float = 0.0
+    udp_fin_tries: int = 0
+    last_activity: float = 0.0      # Общий таймер активности
 
 class FileManager:
     """Менеджер файлов сервера."""
@@ -60,7 +73,7 @@ class FileManager:
         return path.stat().st_size if path.exists() else 0
 
     def create_session(self, filename: str, total_size: int,
-                       client_id: str, is_upload: bool, sock=None) -> TransferSession:
+                       client_id: str, is_upload: bool, sock=None) -> Optional[TransferSession]:
         """Создаёт и регистрирует новую сессию."""
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
 
@@ -73,13 +86,14 @@ class FileManager:
             is_upload=is_upload,
             temp_path=temp_path,
             sock=sock,
-            last_activity=time.time()
+            last_activity=time.time(),
+            udp_last_ack_time=time.time()
         )
 
-        # Открываем файл сразу, чтобы не делать это в цикле
+        # Открываем файл сразу
         try:
             if is_upload:
-                session.file_handle = open(temp_path, 'wb') # Пока без докачки для простоты
+                session.file_handle = open(temp_path, 'wb')
             else:
                 path = self.get_file_path(filename)
                 session.file_handle = open(path, 'rb')
