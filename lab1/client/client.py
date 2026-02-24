@@ -35,6 +35,7 @@ class FileTransferClient:
         except Exception:
             pass
 
+        # Progress throttling
         self._progress_last_ts = 0.0
         self._progress_last_percent = -1
 
@@ -153,9 +154,7 @@ class FileTransferClient:
                         total_size=size,
                         progress_callback=lambda s: self._print_progress(s, size),
                     )
-
                 sent = size
-
             except Exception as e:
                 print(f"UDP Upload error: {e}")
                 sent = 0
@@ -204,6 +203,9 @@ class FileTransferClient:
         return self._do_download(filename, offset, use_udp)
 
     def _do_download(self, filename: str, offset: int, use_udp: bool) -> bool:
+        # ВАЖНО: если пользователь ввёл путь (например N:\file.exe), отправляем только имя файла.
+        filename = Path(filename).name
+
         proto_flag = "--udp" if use_udp else "--tcp"
 
         if offset > 0:
@@ -225,6 +227,7 @@ class FileTransferClient:
             send_all(self.tcp_socket, (command + "\n").encode())
             response = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
             if not response:
+                print("No TCP response")
                 return False
 
             response_str = response.decode().strip()
@@ -320,6 +323,7 @@ class FileTransferClient:
         percent = int((current / total) * 100)
         now = time.time()
 
+        # печатаем: если завершили, или раз в 0.1с, или изменился процент
         if current == total or (now - self._progress_last_ts) >= 0.1 or percent != self._progress_last_percent:
             print(f"\rProgress: {percent}% ({current}/{total} bytes)", end="", flush=True)
             self._progress_last_ts = now
