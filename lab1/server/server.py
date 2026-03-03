@@ -1,4 +1,4 @@
-"""TCP/UDP сервер. UDP download — отдельный поток + отдельный сокет."""
+"""TCP/UDP сервер. UDP download — отдельный поток + сокет, fixed window."""
 
 import socket
 import select
@@ -24,14 +24,14 @@ TCP_CHUNK      = 64 * 1024
 UDP_READ_BATCH = 512
 UDP_UPLOAD_WIN = 4096
 UDP_ACK_EVERY  = 4
-_BURST         = 256
+_BURST         = 128
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
 def _udp_download_worker(server_host, client_addr, session, fm, cid):
-    """UDP download: отдельный сокет + congestion control."""
+    """UDP download: отдельный сокет, fixed window."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
@@ -59,14 +59,14 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
     ts  = session.total_size
     fh  = session.file_handle
     base = 0; nxt = 0; pkts = {}; cur = 0; eof = False
-    cwnd = 64.0; ssth = 512.0; dup = 0; laseq = 0
-    lat  = time.monotonic(); rto = UDP_TIMEOUT
+    lat = time.monotonic()
+    win = UDP_WINDOW_SIZE  # fixed
 
     try:
         while cur < ts or base < nxt:
-            ew = int(min(cwnd, UDP_WINDOW_SIZE))
+            # 1. send
             n = 0
-            while not eof and nxt < base + ew and n < _BURST:
+            while not eof and nxt < base + win and n < _BURST:
                 tr = min(UDP_PAYLOAD_SIZE, ts - cur)
                 if tr <= 0: eof = True; break
                 try: ch = fh.read(tr)
@@ -77,8 +77,8 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
                 nxt += 1; cur += len(ch); n += 1
             session.transferred = cur
 
-            gn = False
-            for _ in range(512):
+            # 2. drain ACK
+            while True:
                 r,_,_ = select.select([sock],[],[],0)
                 if not r: break
                 try: ap,_ = sock.recvfrom(512)
@@ -86,34 +86,25 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
                 s,pt,_ = up(ap)
                 if pt != PacketType.ACK.value: continue
                 if s > base:
-                    ak = s - base
                     for i in range(base, min(s, nxt)): pkts.pop(i,None)
-                    base = s; gn = True; lat = time.monotonic()
-                    dup = 0; laseq = s
-                    cwnd += ak if cwnd < ssth else ak/cwnd
-                elif s == base and s == laseq:
-                    dup += 1
-                    if dup >= 3:
-                        pp = pkts.get(base)
-                        if pp: tx(pp)
-                        ssth = max(cwnd/2, 16); cwnd = ssth + 3
-                        dup = 0; lat = time.monotonic()
+                    base = s; lat = time.monotonic()
 
-            if not gn and base < nxt:
-                now = time.monotonic()
-                if now - lat > rto and pkts:
-                    ssth = max(cwnd/2, 16); cwnd = max(16, ssth/2)
-                    c = 0
-                    for s in range(base, nxt):
-                        pp = pkts.get(s)
-                        if pp: tx(pp); c += 1
-                        if c >= int(cwnd): break
-                    lat = now; rto = min(rto*1.5, 3.0)
-                elif not gn and (nxt >= base + ew or eof):
-                    time.sleep(0.00001)
-            else:
-                rto = max(0.1, rto * 0.95)
+            # 3. window full → micro yield
+            if nxt >= base + win and base < nxt:
+                time.sleep(0.00001)
+                continue
 
+            # 4. timeout retransmit
+            now = time.monotonic()
+            if now - lat > UDP_TIMEOUT and pkts:
+                c = 0
+                for s in range(base, nxt):
+                    pp = pkts.get(s)
+                    if pp: tx(pp); c += 1
+                    if c >= win: break
+                lat = now
+
+        # FIN
         fin = pk(nxt, PacketType.FIN.value)
         for _ in range(30):
             tx(fin)
