@@ -2,12 +2,16 @@
 
 import socket
 import time
+import select
+import struct
 from pathlib import Path
 from typing import Optional, Tuple
 
-from common.protocol import COMMAND_TERMINATOR, BUFFER_SIZE
+from common.protocol import COMMAND_TERMINATOR, BUFFER_SIZE, PacketType
 from common.socket_utils import create_client_socket, recv_until, recv_exact, send_all
 from common.rudp import RUDPSocket
+
+_HDR = struct.Struct("!IB")
 
 
 class FileTransferClient:
@@ -74,6 +78,32 @@ class FileTransferClient:
             resp = RUDPSocket(self.udp_socket, (self.host, self.port)).send_command(cmd)
             if not resp or "READY" not in resp:
                 print(f"Not ready: {resp}"); return False
+
+            upload_port = self._wait_upload_port()
+            if not upload_port:
+                print("No upload port received"); return False
+
+            proto_name = "UDP"
+            print(f"Uploading via {proto_name} (port {upload_port})...")
+            t0 = time.time()
+            try:
+                up_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                up_sock.setblocking(False)
+                for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+                    try: up_sock.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
+                    except: pass
+
+                rudp = RUDPSocket(up_sock, (self.host, upload_port))
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    rudp.send_stream(f, total_size=size,
+                                     progress_callback=lambda s: self._prog(s, size))
+                sent = size
+                up_sock.close()
+            except Exception as e:
+                print(f"\nUDP upload error: {e}"); sent = 0
+            self._stats("Upload", sent, time.time() - t0)
+            return sent == size
         else:
             if not self.connected: return False
             send_all(self.tcp_socket, (cmd + "\n").encode())
@@ -81,26 +111,33 @@ class FileTransferClient:
             resp = raw.decode().strip() if raw else ""
             if not resp or not resp.startswith("READY"):
                 print(f"Not ready: {resp}"); return False
-        print(f"Uploading via {'UDP' if use_udp else 'TCP'}...")
-        t0 = time.time()
-        if use_udp:
-            time.sleep(0.02)
-            try:
-                with open(path, "rb") as f:
-                    f.seek(offset)
-                    RUDPSocket(self.udp_socket, (self.host, self.port)).send_stream(
-                        f, total_size=size,
-                        progress_callback=lambda s: self._prog(s, size))
-                sent = size
-            except Exception as e:
-                print(f"\nUDP upload error: {e}"); sent = 0
+            print("Uploading via TCP...")
+            t0 = time.time()
+            sent = self._send_tcp(path, size, offset)
+            final = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
+            if final: print(final.decode().strip())
             self._stats("Upload", sent, time.time() - t0)
             return sent == size
-        sent = self._send_tcp(path, size, offset)
-        final = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
-        if final: print(final.decode().strip())
-        self._stats("Upload", sent, time.time() - t0)
-        return sent == size
+
+    def _wait_upload_port(self) -> Optional[int]:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            r, _, _ = select.select([self.udp_socket], [], [], 0.1)
+            if not r: continue
+            try:
+                pkt, addr = self.udp_socket.recvfrom(65536)
+            except: continue
+            if len(pkt) < _HDR.size: continue
+            _, pt = _HDR.unpack_from(pkt)
+            if pt == PacketType.CMD.value:
+                msg = pkt[_HDR.size:].decode(errors="ignore")
+                if msg.startswith("UPLOAD_PORT "):
+                    try:
+                        return int(msg.split()[1])
+                    except: pass
+                elif msg == "ACK_CMD":
+                    continue
+        return None
 
     def _send_tcp(self, path, size, offset):
         sent = 0
@@ -138,7 +175,8 @@ class FileTransferClient:
         if "ERROR" in resp_str: print(resp_str); return False
         fsize = self._parse_resp(resp_str)
         if fsize <= 0: print(f"Bad resp: {resp_str}"); return False
-        print(f"Downloading via {'UDP' if use_udp else 'TCP'}...")
+        proto_name = "UDP" if use_udp else "TCP"
+        print(f"Downloading via {proto_name}...")
         t0 = time.time()
         if use_udp:
             fp = self.download_dir / filename
@@ -211,8 +249,8 @@ class InteractiveClient:
 
     def _help(self):
         print("\nCommands:")
-        for c in ["ECHO <text> [--udp]", "TIME [--udp]", "UPLOAD <file> [--udp]",
-                   "DOWNLOAD <file> [--udp]", "RESUME", "QUIT"]:
+        for c in ["ECHO [--udp]", "TIME [--udp]", "UPLOAD [--udp]",
+                   "DOWNLOAD [--udp]", "RESUME", "QUIT"]:
             print(f"  {c}")
 
     def _process(self, cmd):
@@ -221,11 +259,11 @@ class InteractiveClient:
         args = " ".join(p for p in parts[1:] if p.lower() != "--udp")
         if command in ("QUIT","EXIT","CLOSE"): return False
         if command == "UPLOAD":
-            if not args: print("Usage: UPLOAD <file> [--udp]"); return True
+            if not args: print("Usage: UPLOAD [--udp]"); return True
             ok = self.client.upload_file(args, use_udp)
             self.last_up = None if ok else (args, 0, use_udp); return True
         if command == "DOWNLOAD":
-            if not args: print("Usage: DOWNLOAD <file> [--udp]"); return True
+            if not args: print("Usage: DOWNLOAD [--udp]"); return True
             ok = self.client.download_file(args, use_udp)
             self.last_down = None if ok else (args, 0, use_udp); return True
         if command == "RESUME":
