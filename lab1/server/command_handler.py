@@ -11,61 +11,44 @@ from server.file_manager import FileManager
 if TYPE_CHECKING:
     import socket
 
-
 class CommandHandler:
-
     def __init__(self, file_manager: FileManager):
         self.fm = file_manager
         self.handlers = {
-            CommandType.ECHO:            self._echo,
-            CommandType.TIME:            self._time,
-            CommandType.UPLOAD:          self._upload,
-            CommandType.DOWNLOAD:        self._download,
-            CommandType.RESUME_UPLOAD:   self._resume_upload,
+            CommandType.ECHO: self._echo, CommandType.TIME: self._time,
+            CommandType.UPLOAD: self._upload, CommandType.DOWNLOAD: self._download,
+            CommandType.RESUME_UPLOAD: self._resume_upload,
             CommandType.RESUME_DOWNLOAD: self._resume_download,
         }
 
     def execute(self, cmd, tcp_sock, udp_sock, udp_addr):
         h = self.handlers.get(cmd.type)
-        if h:
-            return h(cmd, tcp_sock, udp_sock, udp_addr)
-        return Response(False, f"Unknown: {cmd.raw.strip()}")
+        return h(cmd, tcp_sock, udp_sock, udp_addr) if h else Response(False, f"Unknown: {cmd.raw.strip()}")
 
     def _echo(self, cmd, *_):
         return Response(True, cmd.args[0] if cmd.args else "")
-
     def _time(self, cmd, *_):
         return Response(True, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def _upload(self, cmd, tcp_sock, udp_sock, udp_addr):
-        if len(cmd.args) < 2:
-            return Response(False, "Usage: UPLOAD <filename> <size>")
+        if len(cmd.args) < 2: return Response(False, "Usage: UPLOAD <filename> <size>")
         try: size = int(cmd.args[1])
         except ValueError: return Response(False, "Invalid size")
-        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr,
-                                 cmd.args[0], size, 0)
+        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr, cmd.args[0], size, 0)
 
     def _resume_upload(self, cmd, tcp_sock, udp_sock, udp_addr):
-        if len(cmd.args) < 3:
-            return Response(False, "Usage: RESUME_UPLOAD <f> <off> <size>")
-        try:
-            offset = int(cmd.args[1]); size = int(cmd.args[2])
+        if len(cmd.args) < 3: return Response(False, "Usage: RESUME_UPLOAD <f> <off> <size>")
+        try: offset = int(cmd.args[1]); size = int(cmd.args[2])
         except ValueError: return Response(False, "Invalid args")
-        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr,
-                                 cmd.args[0], size, offset)
+        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr, cmd.args[0], size, offset)
 
-    def _init_upload(self, proto, tcp_sock, udp_sock, udp_addr,
-                     filename, size, offset):
-        cid = (f"{udp_addr[0]}:{udp_addr[1]}"
-               if proto == "UDP" else str(tcp_sock.fileno()))
+    def _init_upload(self, proto, tcp_sock, udp_sock, udp_addr, filename, size, offset):
+        cid = f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP" else str(tcp_sock.fileno())
         self.fm.close_session(cid)
-        sess = self.fm.create_session(filename, size, cid,
-                                      is_upload=True, sock=tcp_sock)
-        if not sess:
-            return Response(False, "Cannot create session")
+        sess = self.fm.create_session(filename, size, cid, is_upload=True, sock=tcp_sock)
+        if not sess: return Response(False, "Cannot create session")
         if offset > 0 and sess.file_handle:
-            sess.transferred = offset
-            sess.file_handle.seek(offset)
+            sess.transferred = offset; sess.file_handle.seek(offset)
         if proto == "UDP":
             pkt = struct.pack("!IB", 0, 3) + b"OK READY\n"
             try: udp_sock.sendto(pkt, udp_addr)
@@ -75,34 +58,24 @@ class CommandHandler:
         return Response(True, "READY")
 
     def _download(self, cmd, tcp_sock, udp_sock, udp_addr):
-        if not cmd.args:
-            return Response(False, "Usage: DOWNLOAD <filename>")
-        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr,
-                                   cmd.args[0], 0)
+        if not cmd.args: return Response(False, "Usage: DOWNLOAD <filename>")
+        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr, cmd.args[0], 0)
 
     def _resume_download(self, cmd, tcp_sock, udp_sock, udp_addr):
-        if len(cmd.args) < 2:
-            return Response(False, "Usage: RESUME_DOWNLOAD <f> <off>")
+        if len(cmd.args) < 2: return Response(False, "Usage: RESUME_DOWNLOAD <f> <off>")
         try: offset = int(cmd.args[1])
         except ValueError: return Response(False, "Invalid offset")
-        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr,
-                                   cmd.args[0], offset)
+        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr, cmd.args[0], offset)
 
-    def _init_download(self, proto, tcp_sock, udp_sock, udp_addr,
-                       filename, offset):
-        if not self.fm.file_exists(filename):
-            return Response(False, "File not found")
-        fsize     = self.fm.get_file_size(filename)
+    def _init_download(self, proto, tcp_sock, udp_sock, udp_addr, filename, offset):
+        if not self.fm.file_exists(filename): return Response(False, "File not found")
+        fsize = self.fm.get_file_size(filename)
         remaining = fsize - offset
-        cid = (f"{udp_addr[0]}:{udp_addr[1]}"
-               if proto == "UDP" else str(tcp_sock.fileno()))
+        cid = f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP" else str(tcp_sock.fileno())
         self.fm.close_session(cid)
-        sess = self.fm.create_session(filename, remaining, cid,
-                                      is_upload=False, sock=tcp_sock)
-        if not sess:
-            return Response(False, "Cannot open file")
-        if offset > 0 and sess.file_handle:
-            sess.file_handle.seek(offset)
+        sess = self.fm.create_session(filename, remaining, cid, is_upload=False, sock=tcp_sock)
+        if not sess: return Response(False, "Cannot open file")
+        if offset > 0 and sess.file_handle: sess.file_handle.seek(offset)
         info = f"FILE {remaining}"
         if proto == "UDP":
             pkt = struct.pack("!IB", 0, 3) + f"OK {info}\n".encode()

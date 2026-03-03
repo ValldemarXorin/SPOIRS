@@ -1,4 +1,4 @@
-"""Протокол обмена сообщениями между клиентом и сервером."""
+"""Протокол обмена сообщениями."""
 
 from dataclasses import dataclass
 from typing import Optional, List
@@ -6,52 +6,34 @@ from enum import Enum
 
 
 class CommandType(Enum):
-    ECHO            = 1
-    TIME            = 2
-    QUIT            = 3
-    UPLOAD          = 4
-    DOWNLOAD        = 5
-    RESUME_UPLOAD   = 6
-    RESUME_DOWNLOAD = 7
-    UNKNOWN         = 8
-
+    ECHO = 1; TIME = 2; QUIT = 3; UPLOAD = 4; DOWNLOAD = 5
+    RESUME_UPLOAD = 6; RESUME_DOWNLOAD = 7; UNKNOWN = 8
 
 class PacketType(Enum):
-    DATA = 0
-    ACK  = 1
-    FIN  = 2
-    CMD  = 3
-
+    DATA = 0; ACK = 1; FIN = 2; CMD = 3
 
 @dataclass
 class Command:
-    type: CommandType
-    args: List[str]
-    raw: str
-    protocol: str = "TCP"
-
+    type: CommandType; args: List[str]; raw: str; protocol: str = "TCP"
 
 @dataclass
 class Response:
-    success: bool
-    message: str
-    data: Optional[bytes] = None
-
+    success: bool; message: str; data: Optional[bytes] = None
 
 COMMAND_TERMINATOR = b"\n"
 BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-# 1400 байт — безопасно на любой сети (< MTU 1500)
-UDP_PACKET_SIZE  = 1400
+# 32 KB — помещается в loopback MTU (65536).
+# На реальной сети OS сделает IP-фрагментацию, что допустимо
+# в рамках лабораторной. Для production используй 1400.
+UDP_PACKET_SIZE  = 32768
 UDP_HEADER_SIZE  = 5
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE   # 1395
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 32763
 
-# Начальное окно. Реальное окно адаптивное (congestion control в rudp.py)
-UDP_WINDOW_SIZE  = 256
-
-UDP_TIMEOUT      = 0.3   # retransmit timeout
+UDP_WINDOW_SIZE  = 1024           # макс окно (пакетов)
+UDP_TIMEOUT      = 0.3            # retransmit timeout
 UDP_RETRY_LIMIT  = 40
 
 
@@ -76,11 +58,11 @@ def parse_command(raw_line: str, default_proto: str = "TCP") -> "Command":
         "RESUME_UPLOAD": CommandType.RESUME_UPLOAD,
         "RESUME_DOWNLOAD": CommandType.RESUME_DOWNLOAD,
     }
-    cmd_type = mapping.get(cmd_name, CommandType.UNKNOWN)
-    args = [" ".join(clean)] if cmd_type == CommandType.ECHO and clean else clean
-    return Command(cmd_type, args, raw_line, protocol)
+    ct = mapping.get(cmd_name, CommandType.UNKNOWN)
+    args = [" ".join(clean)] if ct == CommandType.ECHO and clean else clean
+    return Command(ct, args, raw_line, protocol)
 
 
 def format_response(response: "Response") -> bytes:
-    prefix = "OK" if response.success else "ERROR"
-    return f"{prefix} {response.message}\n".encode(ENCODING)
+    p = "OK" if response.success else "ERROR"
+    return f"{p} {response.message}\n".encode(ENCODING)

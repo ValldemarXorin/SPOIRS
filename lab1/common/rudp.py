@@ -1,12 +1,12 @@
 """
-Reliable UDP — sliding window с congestion control.
+Reliable UDP — sliding window, оптимизированный для throughput.
 
-Ключевое: адаптивное окно (slow start + AIMD).
-  • cwnd начинается с 4, растёт экспоненциально (slow start)
-    до ssthresh, потом линейно (congestion avoidance).
-  • При потере (timeout): ssthresh = cwnd/2, cwnd = 4.
-  • При 3 duplicate ACK: fast retransmit без ожидания timeout.
-  • Пакеты 1400 байт — без IP-фрагментации.
+Ключевые отличия от предыдущей версии:
+  • Пакет 32 KB (loopback MTU = 65536)
+  • Начальный cwnd = 64, ssthresh = 512 — агрессивный slow start
+  • НИКАКИХ select с timeout > 0 в hot path — только select(0) (poll)
+  • send_stream: tight loop отправка → poll ACK → repeat, без пауз
+  • Burst = 256 пакетов за итерацию
 """
 
 import socket
@@ -20,8 +20,8 @@ from .protocol import (
     UDP_TIMEOUT, PacketType, UDP_RETRY_LIMIT,
 )
 
-_MAX_BURST  = 64     # максимум пакетов за 1 итерацию отправки
-_ACK_EVERY  = 4      # клиент шлёт ACK каждые N пакетов
+_BURST    = 256
+_ACK_EVERY = 4
 
 
 class RUDPSocket:
@@ -35,8 +35,6 @@ class RUDPSocket:
                 self.sock.setsockopt(socket.SOL_SOCKET, opt, 8 * 1024 * 1024)
             except OSError:
                 pass
-
-    # ── helpers ────────────────────────────────────────────
 
     def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
         return struct.pack("!IB", seq, ptype) + data
@@ -53,10 +51,10 @@ class RUDPSocket:
                 self.sock.sendto(data, addr)
                 return True
             except BlockingIOError:
-                time.sleep(0.0001)
+                time.sleep(0.00005)
             except OSError as e:
                 if getattr(e, "errno", None) in (11, 10035):
-                    time.sleep(0.0001); continue
+                    time.sleep(0.00005); continue
                 return False
         return False
 
@@ -64,50 +62,39 @@ class RUDPSocket:
 
     def send_command(self, text: str) -> Optional[str]:
         pkt = self._pack(0, PacketType.CMD.value, text.encode())
-        ack_received = False
+        ack = False
         for _ in range(UDP_RETRY_LIMIT):
-            if not ack_received and self.dest_addr:
+            if not ack and self.dest_addr:
                 self._send(pkt, self.dest_addr)
-            wait = 1.0 if ack_received else 0.3
-            t0   = time.monotonic()
+            wait = 1.0 if ack else 0.3
+            t0 = time.monotonic()
             while time.monotonic() - t0 < wait:
                 r, _, _ = select.select([self.sock], [], [], 0.05)
                 if not r: continue
-                try:
-                    rp, addr = self.sock.recvfrom(65536)
-                except (BlockingIOError, OSError):
-                    break
-                if self.dest_addr and addr != self.dest_addr:
-                    continue
+                try: rp, ra = self.sock.recvfrom(65536)
+                except (BlockingIOError, OSError): break
+                if self.dest_addr and ra != self.dest_addr: continue
                 _, rt, rd = self._unpack(rp)
-                if rt != PacketType.CMD.value:
-                    continue
-                dec = rd.decode(errors="ignore")
-                if dec == "ACK_CMD":
-                    ack_received = True; continue
-                return dec
+                if rt != PacketType.CMD.value: continue
+                d = rd.decode(errors="ignore")
+                if d == "ACK_CMD": ack = True; continue
+                return d
         return None
 
     def recv_command(self) -> Tuple[str, Tuple[str, int]]:
-        try:
-            pkt, addr = self.sock.recvfrom(65536)
-        except (BlockingIOError, socket.timeout, OSError):
-            return "", ("", 0)
+        try: pkt, addr = self.sock.recvfrom(65536)
+        except (BlockingIOError, socket.timeout, OSError): return "", ("", 0)
         seq, pt, data = self._unpack(pkt)
-        if pt != PacketType.CMD.value:
-            return "", addr
+        if pt != PacketType.CMD.value: return "", addr
         msg = data.decode(errors="ignore")
-        if msg.startswith("OK ") or msg.startswith("ERROR "):
-            return "", addr
+        if msg.startswith("OK ") or msg.startswith("ERROR "): return "", addr
         self._send(self._pack(seq, PacketType.CMD.value, b"ACK_CMD"), addr)
         return msg, addr
 
-    # ── send_stream (с congestion control) ─────────────────
+    # ── send_stream ────────────────────────────────────────
 
-    def send_stream(
-        self, reader, total_size: int,
-        progress_callback: Callable[[int], None] = None,
-    ) -> None:
+    def send_stream(self, reader, total_size: int,
+                    progress_callback: Callable[[int], None] = None) -> None:
         if not self.dest_addr:
             raise RuntimeError("dest_addr not set")
         addr = self.dest_addr
@@ -118,23 +105,20 @@ class RUDPSocket:
         cursor   = 0
         eof      = False
 
-        # Congestion control
-        cwnd     = 4.0        # начальное окно (slow start)
-        ssthresh = 256.0      # порог перехода из slow start в CA
-        dup_ack_count = 0
-        last_ack_seq  = 0
-
-        last_ack_time = time.monotonic()
-        rto           = 0.3   # начальный retransmit timeout
+        # Congestion window — агрессивный старт для loopback/LAN
+        cwnd       = 64.0
+        ssthresh   = 512.0
+        dup_cnt    = 0
+        last_ack_s = 0
+        last_ack_t = time.monotonic()
+        rto        = UDP_TIMEOUT
 
         while cursor < total_size or base < next_seq:
-            # Эффективное окно: min(cwnd, UDP_WINDOW_SIZE)
-            effective_win = int(min(cwnd, UDP_WINDOW_SIZE))
+            ew = int(min(cwnd, UDP_WINDOW_SIZE))
 
-            # 1. send new packets
-            burst = min(_MAX_BURST, max(1, effective_win - (next_seq - base)))
+            # 1. SEND — заполняем окно
             n = 0
-            while not eof and next_seq < base + effective_win and n < burst:
+            while not eof and next_seq < base + ew and n < _BURST:
                 chunk = reader.read(UDP_PAYLOAD_SIZE)
                 if not chunk:
                     eof = True; cursor = total_size; break
@@ -143,82 +127,64 @@ class RUDPSocket:
                 self._send(pkt, addr)
                 next_seq += 1; cursor += len(chunk); n += 1
 
-            if progress_callback:
+            if progress_callback and n > 0:
                 progress_callback(cursor)
 
-            # 2. read ACKs (nonblocking drain)
-            got_new_ack = False
-            while True:
+            # 2. DRAIN ACK — poll без ожидания (select timeout=0)
+            got_new = False
+            for _ in range(512):  # читаем до 512 ACK за раз
                 r, _, _ = select.select([self.sock], [], [], 0)
                 if not r: break
-                try:
-                    ap, aa = self.sock.recvfrom(256)
-                except (BlockingIOError, OSError):
-                    break
-                if self.dest_addr and aa != self.dest_addr:
-                    continue
+                try: ap, aa = self.sock.recvfrom(512)
+                except (BlockingIOError, OSError): break
+                if self.dest_addr and aa != self.dest_addr: continue
                 aseq, apt, _ = self._unpack(ap)
-                if apt != PacketType.ACK.value:
-                    continue
+                if apt != PacketType.ACK.value: continue
 
                 if aseq > base:
-                    # New ACK — advance window
                     acked = aseq - base
                     for i in range(base, min(aseq, next_seq)):
                         packets.pop(i, None)
-                    base          = aseq
-                    got_new_ack   = True
-                    last_ack_time = time.monotonic()
-                    dup_ack_count = 0
-                    last_ack_seq  = aseq
-
-                    # Congestion control: grow window
+                    base = aseq; got_new = True
+                    last_ack_t = time.monotonic()
+                    dup_cnt = 0; last_ack_s = aseq
                     if cwnd < ssthresh:
-                        # Slow start: +1 за каждый ACK
-                        cwnd += acked
+                        cwnd += acked  # slow start
                     else:
-                        # Congestion avoidance: +1/cwnd за каждый ACK
-                        cwnd += acked / cwnd
+                        cwnd += acked / cwnd  # CA
+                elif aseq == base and aseq == last_ack_s:
+                    dup_cnt += 1
+                    if dup_cnt >= 3:
+                        p = packets.get(base)
+                        if p: self._send(p, addr)
+                        ssthresh = max(cwnd / 2, 16)
+                        cwnd = ssthresh + 3
+                        dup_cnt = 0
+                        last_ack_t = time.monotonic()
 
-                elif aseq == base and aseq == last_ack_seq:
-                    # Duplicate ACK
-                    dup_ack_count += 1
-                    if dup_ack_count >= 3:
-                        # Fast retransmit
-                        pkt = packets.get(base)
-                        if pkt:
-                            self._send(pkt, addr)
-                        # Fast recovery
-                        ssthresh = max(cwnd / 2, 4)
-                        cwnd     = ssthresh + 3
-                        dup_ack_count = 0
-                        last_ack_time = time.monotonic()
-
-            # 3. window full or no new data — short wait for ACK
-            if not got_new_ack and (next_seq >= base + effective_win or eof) and base < next_seq:
-                r, _, _ = select.select([self.sock], [], [], 0.002)
-                if r:
-                    continue  # go back to drain loop
-
-            # 4. timeout retransmit
-            now = time.monotonic()
-            if now - last_ack_time > rto and packets:
-                # Timeout → congestion event
-                ssthresh = max(cwnd / 2, 4)
-                cwnd     = 4  # reset to slow start
-                cnt = 0
-                for s in range(base, next_seq):
-                    p = packets.get(s)
-                    if p:
-                        self._send(p, addr); cnt += 1
-                        if cnt >= int(cwnd):
-                            break
-                last_ack_time = now
-                # Increase RTO (exponential backoff, capped)
-                rto = min(rto * 1.5, 3.0)
-            elif got_new_ack:
-                # Successful ACK → decrease RTO
-                rto = max(0.1, rto * 0.9)
+            # 3. Если нечего отправлять и ждём ACK — КОРОТКИЙ busy-wait
+            #    НЕ select с timeout! Просто continue — цикл крутится
+            #    и снова пробует drain. Это busy-wait, но для throughput
+            #    это правильно.
+            if not got_new and base < next_seq:
+                now = time.monotonic()
+                if now - last_ack_t > rto and packets:
+                    # Timeout → retransmit
+                    ssthresh = max(cwnd / 2, 16)
+                    cwnd = max(16, ssthresh / 2)
+                    cnt = 0
+                    for s in range(base, next_seq):
+                        p = packets.get(s)
+                        if p:
+                            self._send(p, addr); cnt += 1
+                            if cnt >= int(cwnd): break
+                    last_ack_t = now
+                    rto = min(rto * 1.5, 3.0)
+                elif not got_new and (next_seq >= base + ew or eof):
+                    # Окно заполнено, ACK нет — очень короткий yield
+                    time.sleep(0.00001)  # 10 μs
+            else:
+                rto = max(0.1, rto * 0.95)
 
         # FIN
         fin = self._pack(next_seq, PacketType.FIN.value)
@@ -226,10 +192,8 @@ class RUDPSocket:
             self._send(fin, addr)
             r, _, _ = select.select([self.sock], [], [], 0.2)
             if not r: continue
-            try:
-                ap, aa = self.sock.recvfrom(256)
-            except (BlockingIOError, OSError):
-                continue
+            try: ap, aa = self.sock.recvfrom(512)
+            except: continue
             if aa != addr: continue
             aseq, apt, _ = self._unpack(ap)
             if apt == PacketType.ACK.value and aseq == next_seq + 1:
@@ -237,54 +201,44 @@ class RUDPSocket:
 
     # ── recv_stream ────────────────────────────────────────
 
-    def recv_stream(
-        self, writer, total_size: int = 0,
-        progress_callback: Callable[[int], None] = None,
-    ) -> int:
-        expected  = 0
-        ooo: Dict[int, bytes] = {}   # out-of-order buffer
-        total     = 0
-        last_pkt  = time.monotonic()
-        cnt_ack   = 0
-        last_ack  = time.monotonic()
+    def recv_stream(self, writer, total_size: int = 0,
+                    progress_callback: Callable[[int], None] = None) -> int:
+        expected = 0
+        ooo: Dict[int, bytes] = {}
+        total    = 0
+        last_pkt = time.monotonic()
+        cnt_ack  = 0
+        last_ack = time.monotonic()
 
         while True:
             now = time.monotonic()
-            if now - last_pkt > 60.0:
-                break
+            if now - last_pkt > 60.0: break
 
             r, _, _ = select.select([self.sock], [], [], 0.05)
             if not r:
-                # Periodic ACK so sender doesn't stall
                 if now - last_ack > 0.02 and self.dest_addr:
-                    self._send(self._pack(expected, PacketType.ACK.value), self.dest_addr)
+                    self._send(self._pack(expected, PacketType.ACK.value),
+                               self.dest_addr)
                     last_ack = now
                 continue
 
-            # Drain all available packets
+            # drain all
             while True:
-                try:
-                    pkt, addr = self.sock.recvfrom(65536)
-                except (BlockingIOError, OSError):
-                    break
+                try: pkt, addr = self.sock.recvfrom(65536)
+                except (BlockingIOError, OSError): break
 
-                if self.dest_addr is None:
-                    self.dest_addr = addr
-                elif addr != self.dest_addr:
-                    continue
+                if self.dest_addr is None: self.dest_addr = addr
+                elif addr != self.dest_addr: continue
 
                 seq, pt, data = self._unpack(pkt)
                 last_pkt = time.monotonic()
 
-                if pt == PacketType.CMD.value:
-                    continue
+                if pt == PacketType.CMD.value: continue
                 if pt == PacketType.FIN.value:
                     ack = self._pack(seq + 1, PacketType.ACK.value)
-                    for _ in range(3):
-                        self._send(ack, addr)
+                    for _ in range(3): self._send(ack, addr)
                     return total
-                if pt != PacketType.DATA.value:
-                    continue
+                if pt != PacketType.DATA.value: continue
 
                 if seq == expected:
                     writer.write(data); total += len(data)
@@ -295,19 +249,16 @@ class RUDPSocket:
                         expected += 1; cnt_ack += 1
                     if progress_callback:
                         progress_callback(total)
-                elif seq > expected:
-                    if seq < expected + UDP_WINDOW_SIZE * 2:
-                        ooo.setdefault(seq, data)
-                    cnt_ack = _ACK_EVERY  # force immediate ACK
+                elif seq > expected and seq < expected + UDP_WINDOW_SIZE * 2:
+                    ooo.setdefault(seq, data)
+                    cnt_ack = _ACK_EVERY
 
-                # ACK frequently
                 t2 = time.monotonic()
-                if cnt_ack >= _ACK_EVERY or t2 - last_ack > 0.01:
+                if cnt_ack >= _ACK_EVERY or t2 - last_ack > 0.005:
                     self._send(self._pack(expected, PacketType.ACK.value), addr)
                     cnt_ack = 0; last_ack = t2
 
                 r2, _, _ = select.select([self.sock], [], [], 0)
-                if not r2:
-                    break
+                if not r2: break
 
         return total
