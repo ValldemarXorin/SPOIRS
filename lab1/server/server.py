@@ -23,19 +23,19 @@ from server.file_manager import FileManager
 TCP_CHUNK      = 64 * 1024
 UDP_READ_BATCH = 512
 UDP_UPLOAD_WIN = 4096
-UDP_ACK_EVERY  = 8
-_BURST         = 64
+UDP_ACK_EVERY  = 4      # ACK каждые 4 пакета — чаще = быстрее
+_BURST         = 256
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
 def _udp_download_worker(server_host, client_addr, session, fm, cid):
-    """UDP download: отдельный сокет, fixed window."""
+    """UDP download: отдельный сокет, fixed window, pipelined."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-        try: sock.setsockopt(socket.SOL_SOCKET, opt, 4*1024*1024)
+        try: sock.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
         except: pass
     sock.bind((server_host, 0))
 
@@ -49,11 +49,10 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
     def tx(data):
         for attempt in range(20):
             try: sock.sendto(data, client_addr); return True
-            except BlockingIOError: time.sleep(0.0001 * (attempt+1))
+            except BlockingIOError: time.sleep(0.0001*(attempt+1))
             except OSError as e:
                 en = getattr(e,"errno",None) or getattr(e,"winerror",None)
-                if en in (11,10035,35):
-                    time.sleep(0.0001*(attempt+1)); continue
+                if en in (11,10035,35): time.sleep(0.0001*(attempt+1)); continue
                 return False
         return False
 
@@ -65,9 +64,9 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
 
     try:
         while cur < ts or base < nxt:
-            # 1. send
             n = 0
-            while not eof and nxt < base + win and n < _BURST:
+            can = min(_BURST, base + win - nxt)
+            while not eof and n < can:
                 tr = min(UDP_PAYLOAD_SIZE, ts - cur)
                 if tr <= 0: eof = True; break
                 try: ch = fh.read(tr)
@@ -78,9 +77,8 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
                 nxt += 1; cur += len(ch); n += 1
             session.transferred = cur
 
-            # 2. drain ACK
             gn = False
-            for _ in range(256):
+            while True:
                 r,_,_ = select.select([sock],[],[],0)
                 if not r: break
                 try: ap,_ = sock.recvfrom(512)
@@ -91,23 +89,19 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
                     for i in range(base, min(s, nxt)): pkts.pop(i,None)
                     base = s; gn = True; lat = time.monotonic()
 
-            # 3. sent or got ACK → loop
             if n > 0 or gn: continue
 
-            # 4. wait for ACK
-            if base < nxt:
-                r,_,_ = select.select([sock],[],[],0.001)
-                if r: continue
-                now = time.monotonic()
-                if now - lat > UDP_TIMEOUT and pkts:
-                    c = 0
-                    for s in range(base, nxt):
-                        pp = pkts.get(s)
-                        if pp: tx(pp); c += 1
-                        if c >= _BURST: break
-                    lat = now
+            now = time.monotonic()
+            if now - lat > UDP_TIMEOUT and pkts:
+                c = 0
+                for s in range(base, nxt):
+                    pp = pkts.get(s)
+                    if pp: tx(pp); c += 1
+                    if c >= 64: break
+                lat = now
+            else:
+                r,_,_ = select.select([sock],[],[],0.0005)
 
-        # FIN
         fin = pk(nxt, PacketType.FIN.value)
         for _ in range(30):
             tx(fin)
@@ -149,7 +143,7 @@ class TCPServer:
         self.inputs.append(self.server_socket_tcp)
         self.server_socket_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try: self.server_socket_udp.setsockopt(socket.SOL_SOCKET, opt, 4*1024*1024)
+            try: self.server_socket_udp.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
             except: pass
         self.server_socket_udp.bind((self.host, self.port))
         self.server_socket_udp.setblocking(False)
@@ -179,7 +173,7 @@ class TCPServer:
                     s.sock for s in self.file_manager.sessions.values()
                     if not s.is_upload and s.sock and s.sock in self.inputs]
                 rd, wr, ex = select.select(
-                    self.inputs, self.outputs, self.inputs, 0.005)
+                    self.inputs, self.outputs, self.inputs, 0.001)
                 for s in rd:
                     if s is self.server_socket_tcp: self._tcp_accept()
                     elif s is self.server_socket_udp: self._udp_read()
@@ -304,6 +298,7 @@ class TCPServer:
                 elif seq > sess.expected_seq:
                     if seq < sess.expected_seq + UDP_UPLOAD_WIN:
                         sess.udp_recv_buffer.setdefault(seq, data)
+                # ACK каждые 4 пакета
                 if sess.expected_seq % UDP_ACK_EVERY == 0 or seq != sess.expected_seq:
                     rudp._send(rudp._pack(sess.expected_seq, PacketType.ACK.value), addr)
             elif pt == PacketType.FIN.value:

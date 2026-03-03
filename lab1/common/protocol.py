@@ -24,14 +24,10 @@ BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-# 8192 байт — проверено работает на Windows loopback.
 UDP_PACKET_SIZE  = 8192
 UDP_HEADER_SIZE  = 5
 UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 8187
-
-# Фиксированное окно: 256 пакетов × 8KB = 2 MB in flight.
-UDP_WINDOW_SIZE  = 256
-
+UDP_WINDOW_SIZE  = 512   # 512 × 8KB = 4 MB in flight max
 UDP_TIMEOUT      = 0.5
 UDP_RETRY_LIMIT  = 40
 
