@@ -1,4 +1,4 @@
-"""TCP/UDP сервер. UDP download — отдельный поток + сокет, fixed window."""
+"""TCP/UDP сервер — max throughput UDP."""
 
 import socket
 import select
@@ -21,17 +21,20 @@ from server.command_handler import CommandHandler
 from server.file_manager import FileManager
 
 TCP_CHUNK      = 64 * 1024
-UDP_READ_BATCH = 512
+UDP_READ_BATCH = 1024
 UDP_UPLOAD_WIN = 4096
-UDP_ACK_EVERY  = 4      # ACK каждые 4 пакета — чаще = быстрее
-_BURST         = 256
+UDP_ACK_EVERY  = 128     # match client: ACK every 128 packets
+_BURST         = 512
+_PACK_HDR      = struct.Struct("!IB")
+_HDR           = 5
+_READ_CHUNK    = 4 * 1024 * 1024
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
 
 def _udp_download_worker(server_host, client_addr, session, fm, cid):
-    """UDP download: отдельный сокет, fixed window, pipelined."""
+    """UDP download — max throughput, fixed window."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
@@ -39,78 +42,91 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
         except: pass
     sock.bind((server_host, 0))
 
-    HDR = 5
-    def pk(seq, pt, data=b""):
-        return struct.pack("!IB", seq, pt) + data
-    def up(pkt):
-        if len(pkt) < HDR: return -1,-1,b""
-        s,t = struct.unpack("!IB", pkt[:HDR])
-        return s,t,pkt[HDR:]
-    def tx(data):
-        for attempt in range(20):
-            try: sock.sendto(data, client_addr); return True
-            except BlockingIOError: time.sleep(0.0001*(attempt+1))
-            except OSError as e:
-                en = getattr(e,"errno",None) or getattr(e,"winerror",None)
-                if en in (11,10035,35): time.sleep(0.0001*(attempt+1)); continue
-                return False
-        return False
+    sendto = sock.sendto
+    DATA = PacketType.DATA.value
+    ACK  = PacketType.ACK.value
+    FIN  = PacketType.FIN.value
+    payload = UDP_PAYLOAD_SIZE
+    win  = UDP_WINDOW_SIZE
 
-    ts  = session.total_size
-    fh  = session.file_handle
-    base = 0; nxt = 0; pkts = {}; cur = 0; eof = False
-    lat = time.monotonic()
-    win = UDP_WINDOW_SIZE
+    ts   = session.total_size
+    fh   = session.file_handle
+    base = 0; nxt = 0; cur = 0; eof = False
+    lat  = time.monotonic()
+    pkt_buf = []
+    pkt_off = 0
+    file_buf = b""
+    fb_pos   = 0
 
     try:
         while cur < ts or base < nxt:
-            n = 0
-            can = min(_BURST, base + win - nxt)
-            while not eof and n < can:
-                tr = min(UDP_PAYLOAD_SIZE, ts - cur)
-                if tr <= 0: eof = True; break
-                try: ch = fh.read(tr)
-                except: ch = b""
-                if not ch: eof = True; break
-                p = pk(nxt, PacketType.DATA.value, ch)
-                pkts[nxt] = p; tx(p)
-                nxt += 1; cur += len(ch); n += 1
-            session.transferred = cur
+            # SEND
+            room = base + win - nxt
+            if room > 0 and not eof:
+                n = 0
+                while n < room:
+                    if fb_pos >= len(file_buf):
+                        remain = ts - cur
+                        if remain <= 0: eof = True; break
+                        file_buf = fh.read(min(_READ_CHUNK, remain))
+                        fb_pos = 0
+                        if not file_buf: eof = True; break
+                    end = min(fb_pos + payload, len(file_buf))
+                    chunk = file_buf[fb_pos:end]
+                    fb_pos = end
+                    pkt = _PACK_HDR.pack(nxt, DATA) + chunk
+                    pkt_buf.append(pkt)
+                    try: sendto(pkt, client_addr)
+                    except BlockingIOError:
+                        time.sleep(0.00002)
+                        try: sendto(pkt, client_addr)
+                        except: pass
+                    except: pass
+                    nxt += 1; cur += len(chunk); n += 1
+                session.transferred = cur
 
+            # DRAIN ACK
             gn = False
             while True:
                 r,_,_ = select.select([sock],[],[],0)
                 if not r: break
-                try: ap,_ = sock.recvfrom(512)
+                try: ap,_ = sock.recvfrom(64)
                 except: break
-                s,pt,_ = up(ap)
-                if pt != PacketType.ACK.value: continue
+                s,t = _PACK_HDR.unpack_from(ap)
+                if t != ACK: continue
                 if s > base:
-                    for i in range(base, min(s, nxt)): pkts.pop(i,None)
+                    freed = s - pkt_off
+                    if freed > 0 and freed <= len(pkt_buf):
+                        del pkt_buf[:freed]; pkt_off = s
+                    elif freed > len(pkt_buf):
+                        pkt_buf.clear(); pkt_off = s
                     base = s; gn = True; lat = time.monotonic()
 
-            if n > 0 or gn: continue
+            if gn: continue
 
             now = time.monotonic()
-            if now - lat > UDP_TIMEOUT and pkts:
+            if now - lat > UDP_TIMEOUT and pkt_buf:
                 c = 0
-                for s in range(base, nxt):
-                    pp = pkts.get(s)
-                    if pp: tx(pp); c += 1
+                for p in pkt_buf:
+                    try: sendto(p, client_addr)
+                    except: pass
+                    c += 1
                     if c >= 64: break
                 lat = now
-            else:
-                r,_,_ = select.select([sock],[],[],0.0005)
+            elif base < nxt:
+                select.select([sock],[],[],0.0002)
 
-        fin = pk(nxt, PacketType.FIN.value)
+        # FIN
+        fin = _PACK_HDR.pack(nxt, FIN)
         for _ in range(30):
-            tx(fin)
+            try: sendto(fin, client_addr)
+            except: pass
             r,_,_ = select.select([sock],[],[],0.1)
             if not r: continue
-            try: ap,_ = sock.recvfrom(512)
+            try: ap,_ = sock.recvfrom(64)
             except: continue
-            aseq,apt,_ = up(ap)
-            if apt == PacketType.ACK.value and aseq == nxt+1: break
+            s,t = _PACK_HDR.unpack_from(ap)
+            if t == ACK and s == nxt+1: break
 
         br = fm.calculate_bitrate(session)
         print(f"[{_ts()}] UDP Download done: {session.filename} "
@@ -265,11 +281,15 @@ class TCPServer:
     def _udp_read(self):
         if not self.server_socket_udp or not self._rudp: return
         rudp = self._rudp
+        ACK  = PacketType.ACK.value
         for _ in range(UDP_READ_BATCH):
             try: pkt, addr = self.server_socket_udp.recvfrom(65536)
             except (BlockingIOError, socket.error): break
             cid = f"{addr[0]}:{addr[1]}"
-            seq, pt, data = rudp._unpack(pkt)
+            if len(pkt) < _HDR: continue
+            seq, pt = _PACK_HDR.unpack_from(pkt)
+            data = pkt[_HDR:]
+
             if pt == PacketType.CMD.value:
                 rudp._send(rudp._pack(seq, PacketType.CMD.value, b"ACK_CMD"), addr)
                 msg = data.decode(errors="ignore")
@@ -282,6 +302,7 @@ class TCPServer:
                 if cmd.type in xf and not resp.success:
                     rudp._send(rudp._pack(0, PacketType.CMD.value,
                                format_response(resp)), addr)
+
             elif pt == PacketType.DATA.value:
                 sess = self.file_manager.get_session(cid)
                 if not sess or not sess.is_upload: continue
@@ -298,13 +319,14 @@ class TCPServer:
                 elif seq > sess.expected_seq:
                     if seq < sess.expected_seq + UDP_UPLOAD_WIN:
                         sess.udp_recv_buffer.setdefault(seq, data)
-                # ACK каждые 4 пакета
+                # ACK every 128 packets — KEY for throughput
                 if sess.expected_seq % UDP_ACK_EVERY == 0 or seq != sess.expected_seq:
-                    rudp._send(rudp._pack(sess.expected_seq, PacketType.ACK.value), addr)
+                    rudp._send(_PACK_HDR.pack(sess.expected_seq, ACK), addr)
+
             elif pt == PacketType.FIN.value:
                 sess = self.file_manager.get_session(cid)
                 if sess and sess.is_upload:
-                    ack = rudp._pack(seq+1, PacketType.ACK.value)
+                    ack = _PACK_HDR.pack(seq+1, ACK)
                     for _ in range(3): rudp._send(ack, addr)
                     br = self.file_manager.calculate_bitrate(sess)
                     print(f"[{_ts()}] UDP Upload done: {sess.filename} "
