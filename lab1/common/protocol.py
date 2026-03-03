@@ -9,7 +9,7 @@ class CommandType(Enum):
     RESUME_UPLOAD = 6; RESUME_DOWNLOAD = 7; UNKNOWN = 8
 
 class PacketType(Enum):
-    DATA = 0; ACK = 1; FIN = 2; CMD = 3
+    DATA = 0; ACK = 1; FIN = 2; CMD = 3; NACK = 4; DONE = 5
 
 @dataclass
 class Command:
@@ -24,11 +24,10 @@ BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-UDP_PACKET_SIZE  = 8192
-UDP_HEADER_SIZE  = 5
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 8187
-UDP_WINDOW_SIZE  = 512
-UDP_TIMEOUT      = 0.5
+UDP_PACKET_SIZE  = 4096
+UDP_HEADER_SIZE  = 5          # 4 (seq) + 1 (type)
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 4091
+UDP_TIMEOUT      = 2.0
 UDP_RETRY_LIMIT  = 40
 
 
