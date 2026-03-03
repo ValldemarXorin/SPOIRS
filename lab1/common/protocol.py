@@ -43,12 +43,15 @@ BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-UDP_PACKET_SIZE  = 8192
+# 1400 байт — безопасно на любой сети (< MTU 1500)
+UDP_PACKET_SIZE  = 1400
 UDP_HEADER_SIZE  = 5
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE   # 8187
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE   # 1395
 
-UDP_WINDOW_SIZE  = 2048
-UDP_TIMEOUT      = 0.5      # retransmit timeout (сек)
+# Начальное окно. Реальное окно адаптивное (congestion control в rudp.py)
+UDP_WINDOW_SIZE  = 256
+
+UDP_TIMEOUT      = 0.3   # retransmit timeout
 UDP_RETRY_LIMIT  = 40
 
 
@@ -62,12 +65,9 @@ def parse_command(raw_line: str, default_proto: str = "TCP") -> "Command":
     clean: List[str] = []
     for a in parts[1:]:
         al = a.lower()
-        if al == "--udp":
-            protocol = "UDP"
-        elif al == "--tcp":
-            protocol = "TCP"
-        else:
-            clean.append(a)
+        if al == "--udp":   protocol = "UDP"
+        elif al == "--tcp": protocol = "TCP"
+        else: clean.append(a)
     mapping = {
         "ECHO": CommandType.ECHO, "TIME": CommandType.TIME,
         "QUIT": CommandType.QUIT, "EXIT": CommandType.QUIT,
