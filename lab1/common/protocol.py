@@ -43,29 +43,23 @@ BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-# 8 KB пакеты — безопасны на loopback/LAN (нет IP-фрагментации
-# при loopback; на реальной сети MTU=1500 → используй 1400).
 UDP_PACKET_SIZE  = 8192
 UDP_HEADER_SIZE  = 5
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE   # 8187 байт
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE   # 8187
 
-# Окно: 2048 пакетов × 8187 ≈ 16 MB данных "в полёте"
 UDP_WINDOW_SIZE  = 2048
-
-UDP_TIMEOUT      = 1.0   # retransmit timeout
-UDP_RETRY_LIMIT  = 40    # повторы CMD
+UDP_TIMEOUT      = 0.5      # retransmit timeout (сек)
+UDP_RETRY_LIMIT  = 40
 
 
 def parse_command(raw_line: str, default_proto: str = "TCP") -> "Command":
     line = raw_line.strip()
     if not line:
         return Command(CommandType.UNKNOWN, [], raw_line, default_proto)
-
     parts    = line.split()
     cmd_name = parts[0].upper()
     protocol = default_proto
     clean: List[str] = []
-
     for a in parts[1:]:
         al = a.lower()
         if al == "--udp":
@@ -74,20 +68,16 @@ def parse_command(raw_line: str, default_proto: str = "TCP") -> "Command":
             protocol = "TCP"
         else:
             clean.append(a)
-
     mapping = {
-        "ECHO":            CommandType.ECHO,
-        "TIME":            CommandType.TIME,
-        "QUIT":            CommandType.QUIT,
-        "EXIT":            CommandType.QUIT,
-        "CLOSE":           CommandType.QUIT,
-        "UPLOAD":          CommandType.UPLOAD,
-        "DOWNLOAD":        CommandType.DOWNLOAD,
-        "RESUME_UPLOAD":   CommandType.RESUME_UPLOAD,
+        "ECHO": CommandType.ECHO, "TIME": CommandType.TIME,
+        "QUIT": CommandType.QUIT, "EXIT": CommandType.QUIT,
+        "CLOSE": CommandType.QUIT, "UPLOAD": CommandType.UPLOAD,
+        "DOWNLOAD": CommandType.DOWNLOAD,
+        "RESUME_UPLOAD": CommandType.RESUME_UPLOAD,
         "RESUME_DOWNLOAD": CommandType.RESUME_DOWNLOAD,
     }
     cmd_type = mapping.get(cmd_name, CommandType.UNKNOWN)
-    args     = [" ".join(clean)] if cmd_type == CommandType.ECHO and clean else clean
+    args = [" ".join(clean)] if cmd_type == CommandType.ECHO and clean else clean
     return Command(cmd_type, args, raw_line, protocol)
 
 

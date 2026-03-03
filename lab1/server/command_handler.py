@@ -1,5 +1,6 @@
 """Обработчики команд сервера."""
 
+import struct
 import time
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -25,10 +26,7 @@ class CommandHandler:
             CommandType.RESUME_DOWNLOAD: self._resume_download,
         }
 
-    def execute(self, cmd: Command,
-                tcp_sock: Optional["socket.socket"],
-                udp_sock: Optional["socket.socket"],
-                udp_addr: Optional[tuple]) -> Response:
+    def execute(self, cmd, tcp_sock, udp_sock, udp_addr):
         h = self.handlers.get(cmd.type)
         if h:
             return h(cmd, tcp_sock, udp_sock, udp_addr)
@@ -39,6 +37,8 @@ class CommandHandler:
 
     def _time(self, cmd, *_):
         return Response(True, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # ── upload ─────────────────────────────────────────────
 
     def _upload(self, cmd, tcp_sock, udp_sock, udp_addr):
         if len(cmd.args) < 2:
@@ -52,7 +52,7 @@ class CommandHandler:
 
     def _resume_upload(self, cmd, tcp_sock, udp_sock, udp_addr):
         if len(cmd.args) < 3:
-            return Response(False, "Usage: RESUME_UPLOAD <filename> <offset> <size>")
+            return Response(False, "Usage: RESUME_UPLOAD <f> <offset> <size>")
         try:
             offset = int(cmd.args[1])
             size   = int(cmd.args[2])
@@ -75,17 +75,16 @@ class CommandHandler:
             sess.file_handle.seek(offset)
 
         if proto == "UDP":
-            import struct
             pkt = struct.pack("!IB", 0, 3) + b"OK READY\n"
-            for _ in range(5):
-                try:
-                    udp_sock.sendto(pkt, udp_addr)
-                except Exception:
-                    pass
-                time.sleep(0.003)
+            try:
+                udp_sock.sendto(pkt, udp_addr)
+            except Exception:
+                pass
         else:
             send_all(tcp_sock, b"READY\n")
         return Response(True, "READY")
+
+    # ── download ───────────────────────────────────────────
 
     def _download(self, cmd, tcp_sock, udp_sock, udp_addr):
         if not cmd.args:
@@ -95,7 +94,7 @@ class CommandHandler:
 
     def _resume_download(self, cmd, tcp_sock, udp_sock, udp_addr):
         if len(cmd.args) < 2:
-            return Response(False, "Usage: RESUME_DOWNLOAD <filename> <offset>")
+            return Response(False, "Usage: RESUME_DOWNLOAD <f> <offset>")
         try:
             offset = int(cmd.args[1])
         except ValueError:
@@ -107,12 +106,10 @@ class CommandHandler:
                        filename, offset):
         if not self.fm.file_exists(filename):
             return Response(False, "File not found")
-
         fsize     = self.fm.get_file_size(filename)
         remaining = fsize - offset
-        cid       = (f"{udp_addr[0]}:{udp_addr[1]}"
-                     if proto == "UDP" else str(tcp_sock.fileno()))
-
+        cid = (f"{udp_addr[0]}:{udp_addr[1]}"
+               if proto == "UDP" else str(tcp_sock.fileno()))
         self.fm.close_session(cid)
         sess = self.fm.create_session(filename, remaining, cid,
                                       is_upload=False, sock=tcp_sock)
@@ -123,14 +120,11 @@ class CommandHandler:
 
         info = f"FILE {remaining}"
         if proto == "UDP":
-            import struct
             pkt = struct.pack("!IB", 0, 3) + f"OK {info}\n".encode()
-            for _ in range(5):
-                try:
-                    udp_sock.sendto(pkt, udp_addr)
-                except Exception:
-                    pass
-                time.sleep(0.003)
+            try:
+                udp_sock.sendto(pkt, udp_addr)
+            except Exception:
+                pass
         else:
             send_all(tcp_sock, f"{info}\n".encode())
         return Response(True, info)
