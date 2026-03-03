@@ -23,8 +23,8 @@ from server.file_manager import FileManager
 TCP_CHUNK      = 64 * 1024
 UDP_READ_BATCH = 512
 UDP_UPLOAD_WIN = 4096
-UDP_ACK_EVERY  = 4
-_BURST         = 128
+UDP_ACK_EVERY  = 8
+_BURST         = 64
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
@@ -35,7 +35,7 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-        try: sock.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
+        try: sock.setsockopt(socket.SOL_SOCKET, opt, 4*1024*1024)
         except: pass
     sock.bind((server_host, 0))
 
@@ -47,12 +47,13 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
         s,t = struct.unpack("!IB", pkt[:HDR])
         return s,t,pkt[HDR:]
     def tx(data):
-        for _ in range(10):
+        for attempt in range(20):
             try: sock.sendto(data, client_addr); return True
-            except BlockingIOError: time.sleep(0.00005)
+            except BlockingIOError: time.sleep(0.0001 * (attempt+1))
             except OSError as e:
-                if getattr(e,"errno",None) in (11,10035):
-                    time.sleep(0.00005); continue
+                en = getattr(e,"errno",None) or getattr(e,"winerror",None)
+                if en in (11,10035,35):
+                    time.sleep(0.0001*(attempt+1)); continue
                 return False
         return False
 
@@ -60,7 +61,7 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
     fh  = session.file_handle
     base = 0; nxt = 0; pkts = {}; cur = 0; eof = False
     lat = time.monotonic()
-    win = UDP_WINDOW_SIZE  # fixed
+    win = UDP_WINDOW_SIZE
 
     try:
         while cur < ts or base < nxt:
@@ -78,7 +79,8 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
             session.transferred = cur
 
             # 2. drain ACK
-            while True:
+            gn = False
+            for _ in range(256):
                 r,_,_ = select.select([sock],[],[],0)
                 if not r: break
                 try: ap,_ = sock.recvfrom(512)
@@ -87,22 +89,23 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
                 if pt != PacketType.ACK.value: continue
                 if s > base:
                     for i in range(base, min(s, nxt)): pkts.pop(i,None)
-                    base = s; lat = time.monotonic()
+                    base = s; gn = True; lat = time.monotonic()
 
-            # 3. window full → micro yield
-            if nxt >= base + win and base < nxt:
-                time.sleep(0.00001)
-                continue
+            # 3. sent or got ACK → loop
+            if n > 0 or gn: continue
 
-            # 4. timeout retransmit
-            now = time.monotonic()
-            if now - lat > UDP_TIMEOUT and pkts:
-                c = 0
-                for s in range(base, nxt):
-                    pp = pkts.get(s)
-                    if pp: tx(pp); c += 1
-                    if c >= win: break
-                lat = now
+            # 4. wait for ACK
+            if base < nxt:
+                r,_,_ = select.select([sock],[],[],0.001)
+                if r: continue
+                now = time.monotonic()
+                if now - lat > UDP_TIMEOUT and pkts:
+                    c = 0
+                    for s in range(base, nxt):
+                        pp = pkts.get(s)
+                        if pp: tx(pp); c += 1
+                        if c >= _BURST: break
+                    lat = now
 
         # FIN
         fin = pk(nxt, PacketType.FIN.value)
@@ -146,7 +149,7 @@ class TCPServer:
         self.inputs.append(self.server_socket_tcp)
         self.server_socket_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try: self.server_socket_udp.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
+            try: self.server_socket_udp.setsockopt(socket.SOL_SOCKET, opt, 4*1024*1024)
             except: pass
         self.server_socket_udp.bind((self.host, self.port))
         self.server_socket_udp.setblocking(False)

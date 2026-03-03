@@ -24,16 +24,15 @@ BUFFER_SIZE        = 1024 * 1024
 ENCODING           = "utf-8"
 
 # ── UDP ───────────────────────────────────────────────────
-UDP_PACKET_SIZE  = 32768
+# 8192 байт — проверено работает на Windows loopback.
+UDP_PACKET_SIZE  = 8192
 UDP_HEADER_SIZE  = 5
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 32763
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 8187
 
-# Жёсткий лимит окна: 128 пакетов × 32KB = 4 MB in flight.
-# Это безопасно для любого OS recv buffer (Windows default ≈ 1-8 MB).
-# Больше нельзя — OS дропнет пакеты.
-UDP_WINDOW_SIZE  = 128
+# Фиксированное окно: 256 пакетов × 8KB = 2 MB in flight.
+UDP_WINDOW_SIZE  = 256
 
-UDP_TIMEOUT      = 0.3
+UDP_TIMEOUT      = 0.5
 UDP_RETRY_LIMIT  = 40
 
 

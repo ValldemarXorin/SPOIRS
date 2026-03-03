@@ -1,10 +1,9 @@
 """
-Reliable UDP — fixed window, оптимизирован для throughput.
+Reliable UDP — fixed window, пакет 8KB.
 
-Стратегия: фиксированное окно = UDP_WINDOW_SIZE пакетов.
-Нет slow start, нет congestion avoidance — они создают паузы.
-На loopback/LAN потерь практически нет, поэтому CC не нужен.
-При timeout — просто retransmit без изменения окна.
+Стратегия: фиксированное окно, без congestion control.
+Окно = 256 пакетов × 8KB = 2 MB max in flight.
+Burst = 64 пакетов за итерацию (чтобы не перегрузить буфер).
 """
 
 import socket
@@ -18,8 +17,8 @@ from .protocol import (
     UDP_TIMEOUT, PacketType, UDP_RETRY_LIMIT,
 )
 
-_BURST     = 128    # макс пакетов за 1 итерацию отправки
-_ACK_EVERY = 4      # клиент шлёт ACK каждые N пакетов
+_BURST     = 64
+_ACK_EVERY = 8
 
 
 class RUDPSocket:
@@ -29,7 +28,7 @@ class RUDPSocket:
         self.sock      = sock
         self.dest_addr = dest_addr
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try: self.sock.setsockopt(socket.SOL_SOCKET, opt, 8 * 1024 * 1024)
+            try: self.sock.setsockopt(socket.SOL_SOCKET, opt, 4 * 1024 * 1024)
             except OSError: pass
 
     def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
@@ -41,13 +40,15 @@ class RUDPSocket:
         return s, t, pkt[UDP_HEADER_SIZE:]
 
     def _send(self, data: bytes, addr: tuple) -> bool:
-        for _ in range(10):
+        for attempt in range(20):
             try:
                 self.sock.sendto(data, addr); return True
-            except BlockingIOError: time.sleep(0.00005)
+            except BlockingIOError:
+                time.sleep(0.0001 * (attempt + 1))
             except OSError as e:
-                if getattr(e, "errno", None) in (11, 10035):
-                    time.sleep(0.00005); continue
+                errno = getattr(e, "errno", None) or getattr(e, "winerror", None)
+                if errno in (11, 10035, 35):  # EAGAIN / EWOULDBLOCK
+                    time.sleep(0.0001 * (attempt + 1)); continue
                 return False
         return False
 
@@ -96,11 +97,11 @@ class RUDPSocket:
         cursor   = 0
         eof      = False
         last_ack = time.monotonic()
-        win      = UDP_WINDOW_SIZE     # фиксированное окно
+        win      = UDP_WINDOW_SIZE
 
         while cursor < total_size or base < next_seq:
 
-            # 1. SEND — заполняем окно до win
+            # 1. Send new packets (burst-limited)
             n = 0
             while not eof and next_seq < base + win and n < _BURST:
                 chunk = reader.read(UDP_PAYLOAD_SIZE)
@@ -114,8 +115,9 @@ class RUDPSocket:
             if progress_callback and n > 0:
                 progress_callback(cursor)
 
-            # 2. DRAIN ACK — poll all available (timeout=0)
-            while True:
+            # 2. Drain ACKs (non-blocking poll)
+            got_new = False
+            for _ in range(256):
                 r, _, _ = select.select([self.sock], [], [], 0)
                 if not r: break
                 try: ap, aa = self.sock.recvfrom(512)
@@ -126,24 +128,28 @@ class RUDPSocket:
                 if aseq > base:
                     for i in range(base, min(aseq, next_seq)):
                         packets.pop(i, None)
-                    base     = aseq
+                    base = aseq; got_new = True
                     last_ack = time.monotonic()
 
-            # 3. Window full, no new ACK — micro-yield then retry
-            if next_seq >= base + win and base < next_seq:
-                time.sleep(0.00001)  # 10 μs yield
+            # 3. If we sent new packets → loop immediately (no wait)
+            if n > 0 or got_new:
                 continue
 
-            # 4. Timeout → retransmit unacked packets
-            now = time.monotonic()
-            if now - last_ack > UDP_TIMEOUT and packets:
-                cnt = 0
-                for s in range(base, next_seq):
-                    p = packets.get(s)
-                    if p:
-                        self._send(p, addr); cnt += 1
-                        if cnt >= win: break
-                last_ack = now
+            # 4. Window full, waiting for ACK — short wait
+            if base < next_seq:
+                r, _, _ = select.select([self.sock], [], [], 0.001)
+                if r: continue  # go drain
+
+                # Timeout check
+                now = time.monotonic()
+                if now - last_ack > UDP_TIMEOUT and packets:
+                    cnt = 0
+                    for s in range(base, next_seq):
+                        p = packets.get(s)
+                        if p:
+                            self._send(p, addr); cnt += 1
+                            if cnt >= _BURST: break
+                    last_ack = now
 
         # FIN
         fin = self._pack(next_seq, PacketType.FIN.value)
@@ -175,7 +181,7 @@ class RUDPSocket:
 
             r, _, _ = select.select([self.sock], [], [], 0.05)
             if not r:
-                if now - last_ack > 0.02 and self.dest_addr:
+                if now - last_ack > 0.05 and self.dest_addr:
                     self._send(self._pack(expected, PacketType.ACK.value),
                                self.dest_addr)
                     last_ack = now
@@ -205,14 +211,13 @@ class RUDPSocket:
                         d = ooo.pop(expected)
                         writer.write(d); total += len(d)
                         expected += 1; cnt_ack += 1
-                    if progress_callback:
-                        progress_callback(total)
-                elif seq > expected and seq < expected + UDP_WINDOW_SIZE * 4:
+                    if progress_callback: progress_callback(total)
+                elif seq > expected and seq < expected + win * 4:
                     ooo.setdefault(seq, data)
-                    cnt_ack = _ACK_EVERY
+                    cnt_ack = _ACK_EVERY  # force ACK
 
                 t2 = time.monotonic()
-                if cnt_ack >= _ACK_EVERY or t2 - last_ack > 0.005:
+                if cnt_ack >= _ACK_EVERY or t2 - last_ack > 0.01:
                     self._send(self._pack(expected, PacketType.ACK.value), addr)
                     cnt_ack = 0; last_ack = t2
 
