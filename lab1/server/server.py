@@ -1,4 +1,4 @@
-"""TCP/UDP сервер — UDP upload/download в отдельных потоках с выделенными сокетами."""
+"""TCP/UDP сервер — upload drain в tight loop, download в отдельном потоке."""
 
 import socket
 import select
@@ -21,9 +21,9 @@ from server.command_handler import CommandHandler
 from server.file_manager import FileManager
 
 TCP_CHUNK      = 64 * 1024
-UDP_READ_BATCH = 512
 _HDR           = struct.Struct("!IB")
-_READ_CHUNK    = 4 * 1024 * 1024
+_ACK_EVERY     = 256
+_UPLOAD_WIN    = 4096
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
@@ -40,52 +40,14 @@ def _udp_download_worker(server_host, client_addr, session, fm, cid):
 
     try:
         rudp = RUDPSocket(sock, client_addr)
-        with session.file_handle as fh:
-            rudp.send_stream(fh, session.total_size)
+        fh = session.file_handle
+        rudp.send_stream(fh, session.total_size)
         session.transferred = session.total_size
         br = fm.calculate_bitrate(session)
         print(f"[{_ts()}] UDP Download done: {session.filename} "
               f"[{cid}] ({fm.format_bitrate(br)})")
     except Exception as exc:
         print(f"[{_ts()}] UDP Download error [{cid}]: {exc}")
-    finally:
-        fm.complete_session(cid)
-        try: sock.close()
-        except: pass
-
-
-def _udp_upload_worker(server_host, client_addr, session, fm, cid, main_sock):
-    """UDP upload: dedicated socket, tight recv loop.
-
-    Binds a new socket, tells client the port via main_sock,
-    then receives all data on the dedicated socket.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setblocking(False)
-    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-        try: sock.setsockopt(socket.SOL_SOCKET, opt, 8*1024*1024)
-        except: pass
-    sock.bind((server_host, 0))
-
-    _, upload_port = sock.getsockname()
-
-    # Tell client the dedicated upload port via CMD response on main socket
-    port_msg = _HDR.pack(0, PacketType.CMD.value) + f"UPLOAD_PORT {upload_port}".encode()
-    for _ in range(10):
-        try: main_sock.sendto(port_msg, client_addr)
-        except: pass
-        time.sleep(0.02)
-
-    try:
-        rudp = RUDPSocket(sock, client_addr)
-        with session.file_handle as fh:
-            received = rudp.recv_stream(fh, session.total_size)
-        session.transferred = received
-        br = fm.calculate_bitrate(session)
-        print(f"[{_ts()}] UDP Upload done: {session.filename} "
-              f"[{cid}] ({fm.format_bitrate(br)})")
-    except Exception as exc:
-        print(f"[{_ts()}] UDP Upload error [{cid}]: {exc}")
     finally:
         fm.complete_session(cid)
         try: sock.close()
@@ -104,6 +66,9 @@ class TCPServer:
         self.tcp_buffers: Dict[int, bytes] = {}
         self._rudp: Optional[RUDPSocket] = None
         self._threads: Dict[str, threading.Thread] = {}
+        # Active UDP upload session (only one at a time)
+        self._udp_upload_cid: Optional[str] = None
+        self._udp_upload_addr: Optional[tuple] = None
 
     def start(self):
         self._setup_signals()
@@ -138,6 +103,11 @@ class TCPServer:
     def _loop(self):
         while self.running:
             try:
+                # If active UDP upload → tight drain mode
+                if self._udp_upload_cid:
+                    self._udp_upload_drain()
+                    continue
+
                 self.outputs = [
                     s.sock for s in self.file_manager.sessions.values()
                     if not s.is_upload and s.sock and s.sock in self.inputs]
@@ -149,18 +119,125 @@ class TCPServer:
                     else: self._tcp_read(s)
                 for s in wr: self._tcp_write(s)
                 for s in ex: self._remove(s)
-                self._spawn_threads()
-            except: pass
+                self._spawn_download()
+            except Exception as exc:
+                pass
 
-    def _spawn_threads(self):
-        """Spawn dedicated threads for UDP download sessions."""
+    def _udp_upload_drain(self):
+        """Tight loop: drain UDP packets for active upload. No TCP, no select timeout."""
+        cid = self._udp_upload_cid
+        addr = self._udp_upload_addr
+        sess = self.file_manager.get_session(cid)
+        if not sess or not sess.is_upload:
+            self._udp_upload_cid = None
+            self._udp_upload_addr = None
+            return
+
+        sock = self.server_socket_udp
+        rudp = self._rudp
+        ACK = PacketType.ACK.value
+        DATA = PacketType.DATA.value
+        FIN = PacketType.FIN.value
+        CMD = PacketType.CMD.value
+        cnt_ack = 0
+        last_ack = time.monotonic()
+        write_buf = bytearray()
+        _FLUSH = 1024 * 1024  # 1 MB
+
+        while self.running:
+            r, _, _ = select.select([sock], [], [], 0.05)
+            if not r:
+                now = time.monotonic()
+                if now - last_ack > 0.05:
+                    rudp._send(_HDR.pack(sess.expected_seq, ACK), addr)
+                    last_ack = now
+                if now - sess.last_activity > 30.0:
+                    print(f"[{_ts()}] UDP Upload timeout [{cid}]")
+                    break
+                continue
+
+            while True:
+                try: pkt, paddr = sock.recvfrom(65536)
+                except: break
+
+                if len(pkt) < _HDR.size: continue
+                seq, pt = _HDR.unpack_from(pkt)
+
+                if pt == CMD:
+                    # Handle commands even during upload
+                    data = pkt[_HDR.size:]
+                    rudp._send(rudp._pack(seq, CMD, b"ACK_CMD"), paddr)
+                    continue
+
+                if paddr != addr: continue
+                sess.last_activity = time.monotonic()
+
+                if pt == DATA:
+                    data = pkt[_HDR.size:]
+                    if seq == sess.expected_seq:
+                        write_buf.extend(data)
+                        sess.transferred += len(data)
+                        sess.expected_seq += 1
+                        cnt_ack += 1
+                        # Drain OOO buffer
+                        while sess.expected_seq in sess.udp_recv_buffer:
+                            d = sess.udp_recv_buffer.pop(sess.expected_seq)
+                            write_buf.extend(d)
+                            sess.transferred += len(d)
+                            sess.expected_seq += 1
+                            cnt_ack += 1
+                        # Flush write buffer
+                        if len(write_buf) >= _FLUSH:
+                            sess.file_handle.write(bytes(write_buf))
+                            write_buf.clear()
+                        self._log(cid, sess, "UDP Upload")
+                    elif seq > sess.expected_seq:
+                        if seq < sess.expected_seq + _UPLOAD_WIN:
+                            sess.udp_recv_buffer.setdefault(seq, pkt[_HDR.size:])
+                        cnt_ack = _ACK_EVERY  # force ACK on OOO
+
+                    # ACK
+                    if cnt_ack >= _ACK_EVERY or time.monotonic() - last_ack > 0.01:
+                        rudp._send(_HDR.pack(sess.expected_seq, ACK), addr)
+                        cnt_ack = 0; last_ack = time.monotonic()
+
+                elif pt == FIN:
+                    # Flush remaining
+                    if write_buf:
+                        sess.file_handle.write(bytes(write_buf))
+                        write_buf.clear()
+                    # Send ACK for FIN
+                    ack = _HDR.pack(seq + 1, ACK)
+                    for _ in range(5): rudp._send(ack, addr)
+                    br = self.file_manager.calculate_bitrate(sess)
+                    print(f"[{_ts()}] UDP Upload done: {sess.filename} "
+                          f"[{cid}] ({self.file_manager.format_bitrate(br)})")
+                    self.file_manager.complete_session(cid)
+                    self._udp_upload_cid = None
+                    self._udp_upload_addr = None
+                    return
+
+                r2, _, _ = select.select([sock], [], [], 0)
+                if not r2: break
+
+            # Periodic ACK outside inner loop
+            if cnt_ack > 0 and time.monotonic() - last_ack > 0.005:
+                rudp._send(_HDR.pack(sess.expected_seq, ACK), addr)
+                cnt_ack = 0; last_ack = time.monotonic()
+
+        # Timeout / stopped
+        if write_buf:
+            sess.file_handle.write(bytes(write_buf))
+        self.file_manager.complete_session(cid)
+        self._udp_upload_cid = None
+        self._udp_upload_addr = None
+
+    def _spawn_download(self):
         for cid, sess in list(self.file_manager.sessions.items()):
-            if sess.sock is not None: continue  # TCP session
+            if sess.is_upload or sess.sock is not None: continue
             if cid in self._threads:
                 if not self._threads[cid].is_alive(): del self._threads[cid]
                 continue
-            if sess.is_upload: continue  # upload spawned immediately in _udp_read
-            # Download: spawn worker
             try:
                 h,p = cid.split(":",1); addr = (h, int(p))
             except:
@@ -235,10 +312,10 @@ class TCPServer:
             except socket.error: self._remove(sock)
 
     def _udp_read(self):
-        """Handle UDP commands only. Data transfer happens in worker threads."""
+        """Handle UDP commands. When upload starts → activate tight drain mode."""
         if not self.server_socket_udp or not self._rudp: return
         rudp = self._rudp
-        for _ in range(UDP_READ_BATCH):
+        for _ in range(512):
             try: pkt, addr = self.server_socket_udp.recvfrom(65536)
             except (BlockingIOError, socket.error): break
             if len(pkt) < _HDR.size: continue
@@ -258,19 +335,14 @@ class TCPServer:
                 if cmd.type in xf and resp.success:
                     sess = self.file_manager.get_session(cid)
                     if sess and sess.is_upload:
-                        # Spawn upload worker with dedicated socket
-                        bh = self.host if self.host not in ("0.0.0.0","") else ""
-                        t = threading.Thread(
-                            target=_udp_upload_worker,
-                            args=(bh, addr, sess, self.file_manager, cid,
-                                  self.server_socket_udp),
-                            daemon=True)
-                        self._threads[cid] = t; t.start()
+                        # Activate tight drain mode for this upload
+                        self._udp_upload_cid = cid
+                        self._udp_upload_addr = addr
                         print(f"[{_ts()}] UDP Upload started: {sess.filename} [{cid}]")
+                        return  # exit _udp_read, main loop will enter drain mode
                 elif cmd.type in xf:
                     rudp._send(rudp._pack(0, PacketType.CMD.value,
                                format_response(resp)), addr)
-            # Ignore DATA/FIN/ACK on main socket — handled by worker threads
 
     def _log(self, cid, sess, op):
         if sess.total_size <= 0: return
