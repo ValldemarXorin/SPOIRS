@@ -1,12 +1,7 @@
-"""
-Reliable UDP — windowed, optimized for dedicated receiver thread.
+"""Aggressive Reliable UDP для локальной сети.
 
-Upload: client sends windowed data to server's dedicated upload socket.
-Download: server sends windowed data from dedicated download socket.
-Both sides: dedicated socket = tight recv loop = no packet loss.
-
-Window = 1024 × 4091 = ~4 MB in flight.
-ACK every 256 packets from receiver.
+Пакет 8KB, окно 4096 пакетов (≈32 MB), ACK раз в 64 пакета.
+Заточено под максимальную скорость на низком RTT.
 """
 
 import socket
@@ -16,258 +11,576 @@ import select
 from typing import Optional, Tuple, Dict, Callable
 
 from .protocol import (
-    UDP_PAYLOAD_SIZE, UDP_HEADER_SIZE, UDP_WINDOW_SIZE,
-    UDP_TIMEOUT, PacketType, UDP_RETRY_LIMIT,
+    UDP_PAYLOAD_SIZE,
+    UDP_HEADER_SIZE,
+    UDP_WINDOW_SIZE,
+    UDP_TIMEOUT,
+    PacketType,
+    UDP_RETRY_LIMIT,
 )
 
+
 _HDR = struct.Struct("!IB")
+_BURST = 1024          # до 1024 пакетов за итерацию
+_ACK_EVERY = 64        # ACK раз в 64 пакета
 _READ_CHUNK = 4 * 1024 * 1024
-_ACK_EVERY = 256
-_BURST = 512
 
 
 class RUDPSocket:
-
-    def __init__(self, sock: socket.socket,
-                 dest_addr: Optional[Tuple[str, int]] = None):
-        self.sock      = sock
+    def __init__(self, sock: socket.socket, dest_addr: Optional[Tuple[str, int]] = None):
+        self.sock = sock
         self.dest_addr = dest_addr
+
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try: self.sock.setsockopt(socket.SOL_SOCKET, opt, 8 * 1024 * 1024)
-            except OSError: pass
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, opt, 16 * 1024 * 1024)
+            except OSError:
+                pass
+
+    # ── low-level helpers ─────────────────────────────────
 
     def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
         return _HDR.pack(seq, ptype) + data
 
-    def _send(self, data: bytes, addr: tuple) -> bool:
-        try:
-            self.sock.sendto(data, addr); return True
-        except BlockingIOError:
-            time.sleep(0.0001)
-            try: self.sock.sendto(data, addr); return True
-            except: return False
-        except OSError:
-            return False
+    def _unpack(self, pkt: bytes):
+        if len(pkt) < UDP_HEADER_SIZE:
+            return -1, -1, b""
+        s, t = _HDR.unpack_from(pkt)
+        return s, t, pkt[UDP_HEADER_SIZE:]
 
-    # ── CMD (on main socket) ──────────────────────────────
+    def _send(self, data: bytes, addr: Tuple[str, int]) -> bool:
+        for _ in range(4):
+            try:
+                self.sock.sendto(data, addr)
+                return True
+            except (BlockingIOError, InterruptedError):
+                time.sleep(0.00001)
+            except OSError:
+                return False
+        return False
+
+    # ── командный канал ───────────────────────────────────
 
     def send_command(self, text: str) -> Optional[str]:
+        if not self.dest_addr:
+            raise RuntimeError("dest_addr not set")
+
+        addr = self.dest_addr
         pkt = self._pack(0, PacketType.CMD.value, text.encode())
-        ack = False
+
         for _ in range(UDP_RETRY_LIMIT):
-            if not ack and self.dest_addr: self._send(pkt, self.dest_addr)
-            wait = 1.0 if ack else 0.3; t0 = time.monotonic()
-            while time.monotonic() - t0 < wait:
+            self._send(pkt, addr)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 0.5:
                 r, _, _ = select.select([self.sock], [], [], 0.05)
-                if not r: continue
-                try: rp, ra = self.sock.recvfrom(65536)
-                except: break
-                if self.dest_addr and ra != self.dest_addr: continue
-                if len(rp) < _HDR.size: continue
-                _, rt = _HDR.unpack_from(rp)
-                if rt != PacketType.CMD.value: continue
-                d = rp[_HDR.size:].decode(errors="ignore")
-                if d == "ACK_CMD": ack = True; continue
-                return d
+                if not r:
+                    continue
+                try:
+                    rp, ra = self.sock.recvfrom(65536)
+                except OSError:
+                    break
+                if ra != addr or len(rp) < UDP_HEADER_SIZE:
+                    continue
+                s, t = _HDR.unpack_from(rp)
+                if t != PacketType.CMD.value:
+                    continue
+                data = rp[UDP_HEADER_SIZE:]
+                msg = data.decode(errors="ignore")
+                if msg == "ACK_CMD":
+                    continue
+                return msg
         return None
 
-    def recv_command(self) -> Tuple[str, Tuple[str, int]]:
-        try: pkt, addr = self.sock.recvfrom(65536)
-        except: return "", ("", 0)
-        if len(pkt) < _HDR.size: return "", addr
-        s, t = _HDR.unpack_from(pkt)
-        if t != PacketType.CMD.value: return "", addr
-        msg = pkt[_HDR.size:].decode(errors="ignore")
-        if msg.startswith("OK ") or msg.startswith("ERROR "): return "", addr
-        self._send(self._pack(s, PacketType.CMD.value, b"ACK_CMD"), addr)
-        return msg, addr
-
-    # ── send_stream (windowed, fast) ──────────────────────
+    # ── send_stream: максимально агрессивная отправка ─────
 
     def send_stream(self, reader, total_size: int,
                     progress_callback: Callable[[int], None] = None) -> None:
-        """Send file data with fixed window. Used by client upload & server download."""
         if not self.dest_addr:
             raise RuntimeError("dest_addr not set")
-        addr   = self.dest_addr
-        sock   = self.sock
-        sendto = sock.sendto
-        DATA   = PacketType.DATA.value
-        ACK    = PacketType.ACK.value
-        FIN    = PacketType.FIN.value
-        psize  = UDP_PAYLOAD_SIZE
-        win    = UDP_WINDOW_SIZE
 
-        base     = 0
+        addr = self.dest_addr
+        sock = self.sock
+        sendto = sock.sendto
+
+        base = 0
         next_seq = 0
-        pkt_buf  = []
-        pkt_off  = 0
-        cursor   = 0
-        eof      = False
+        packets: Dict[int, bytes] = {}
+        cursor = 0
+        eof = False
         last_ack = time.monotonic()
-        file_buf = b""
-        fb_pos   = 0
+        win = UDP_WINDOW_SIZE
+        last_prog = 0
 
         while cursor < total_size or base < next_seq:
-            # 1. SEND — fill window
-            room = min(_BURST, base + win - next_seq)
-            if room > 0 and not eof:
-                sent_n = 0
-                while sent_n < room:
-                    if fb_pos >= len(file_buf):
-                        file_buf = reader.read(_READ_CHUNK)
-                        fb_pos = 0
-                        if not file_buf:
-                            eof = True; cursor = total_size; break
-                    end = min(fb_pos + psize, len(file_buf))
-                    chunk = file_buf[fb_pos:end]
-                    fb_pos = end
+            # 1. Заполняем окно
+            can_send = min(_BURST, base + win - next_seq)
+            n = 0
+            while not eof and n < can_send:
+                chunk = reader.read(UDP_PAYLOAD_SIZE)
+                if not chunk:
+                    eof = True
+                    cursor = total_size
+                    break
+                pkt = self._pack(next_seq, PacketType.DATA.value, chunk)
+                packets[next_seq] = pkt
+                try:
+                    sendto(pkt, addr)
+                except (BlockingIOError, InterruptedError):
+                    time.sleep(0.00001)
+                    try:
+                        sendto(pkt, addr)
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+                next_seq += 1
+                cursor += len(chunk)
+                n += 1
 
-                    pkt = _HDR.pack(next_seq, DATA) + chunk
-                    pkt_buf.append(pkt)
-                    try: sendto(pkt, addr)
-                    except BlockingIOError:
-                        time.sleep(0.00002)
-                        try: sendto(pkt, addr)
-                        except: pass
-                    except: pass
-                    next_seq += 1
-                    cursor += len(chunk)
-                    sent_n += 1
+            if progress_callback and cursor - last_prog > max(total_size // 100, 1):
+                progress_callback(min(cursor, total_size))
+                last_prog = cursor
 
-                if progress_callback:
-                    progress_callback(min(cursor, total_size))
-
-            # 2. DRAIN ACKs
-            got_new = False
+            # 2. Читаем ACK'и
+            moved = False
             while True:
                 r, _, _ = select.select([sock], [], [], 0)
-                if not r: break
-                try: ap, _ = sock.recvfrom(64)
-                except: break
-                if len(ap) < _HDR.size: continue
+                if not r:
+                    break
+                try:
+                    ap, _ = sock.recvfrom(64)
+                except OSError:
+                    break
+                if len(ap) < UDP_HEADER_SIZE:
+                    continue
                 s, t = _HDR.unpack_from(ap)
-                if t != ACK: continue
+                if t != PacketType.ACK.value:
+                    continue
                 if s > base:
-                    freed = s - pkt_off
-                    if 0 < freed <= len(pkt_buf):
-                        del pkt_buf[:freed]; pkt_off = s
-                    elif freed > len(pkt_buf):
-                        pkt_buf.clear(); pkt_off = s
-                    base = s; got_new = True; last_ack = time.monotonic()
+                    for k in range(base, s):
+                        packets.pop(k, None)
+                    base = s
+                    last_ack = time.monotonic()
+                    moved = True
 
-            if got_new: continue
+            if moved:
+                continue
 
-            # 3. No progress — timeout retransmit or wait
+            # 3. Таймаут — переотправка части окна
             now = time.monotonic()
-            if now - last_ack > UDP_TIMEOUT and pkt_buf:
+            if packets and now - last_ack > UDP_TIMEOUT:
                 cnt = 0
-                for p in pkt_buf:
-                    try: sendto(p, addr)
-                    except: pass
+                for k in sorted(packets.keys()):
+                    try:
+                        sendto(packets[k], addr)
+                    except OSError:
+                        pass
                     cnt += 1
-                    if cnt >= 64: break
+                    if cnt >= 512:
+                        break
                 last_ack = now
-            elif base < next_seq:
-                select.select([sock], [], [], 0.0002)
+            else:
+                time.sleep(0.0001)
 
         # FIN
-        fin = self._pack(next_seq, FIN)
+        fin_seq = next_seq
+        fin_pkt = self._pack(fin_seq, PacketType.FIN.value)
         for _ in range(25):
-            self._send(fin, addr)
+            self._send(fin_pkt, addr)
             r, _, _ = select.select([sock], [], [], 0.2)
-            if not r: continue
-            try: ap, aa = sock.recvfrom(64)
-            except: continue
-            if aa != addr: continue
-            if len(ap) < _HDR.size: continue
+            if not r:
+                continue
+            try:
+                ap, _ = sock.recvfrom(64)
+            except OSError:
+                continue
+            if len(ap) < UDP_HEADER_SIZE:
+                continue
             s, t = _HDR.unpack_from(ap)
-            if t == ACK and s == next_seq + 1: break
+            if t == PacketType.ACK.value and s == fin_seq + 1:
+                break
 
-    # ── recv_stream (tight loop, for dedicated socket) ────
+    # ── recv_stream: быстрый приём ────────────────────────
 
     def recv_stream(self, writer, total_size: int = 0,
                     progress_callback: Callable[[int], None] = None) -> int:
-        """Receive file data. Sends ACK every _ACK_EVERY packets."""
-        sock     = self.sock
-        DATA     = PacketType.DATA.value
-        ACK      = PacketType.ACK.value
-        FIN      = PacketType.FIN.value
-        CMD      = PacketType.CMD.value
-        win      = UDP_WINDOW_SIZE
+        sock = self.sock
 
         expected = 0
         ooo: Dict[int, bytes] = {}
-        total    = 0
+        total = 0
         last_pkt = time.monotonic()
-        cnt_ack  = 0
         last_ack = time.monotonic()
+        cnt_ack = 0
         write_buf = bytearray()
-        _FLUSH   = 1024 * 1024
+        FLUSH = 1024 * 1024
 
         while True:
             now = time.monotonic()
-            if now - last_pkt > 30.0: break
+            if now - last_pkt > 30.0:
+                break
 
             r, _, _ = select.select([sock], [], [], 0.05)
             if not r:
-                # Periodic ACK to keep sender alive
-                if now - last_ack > 0.05 and self.dest_addr:
-                    self._send(_HDR.pack(expected, ACK), self.dest_addr)
+                if now - last_ack > 0.05 and self.dest_addr is not None:
+                    self._send(_HDR.pack(expected, PacketType.ACK.value), self.dest_addr)
                     last_ack = now
                 continue
 
-            # Drain all available
-            while True:
-                try: pkt, addr = sock.recvfrom(65536)
-                except: break
+            try:
+                pkt, addr = sock.recvfrom(65536)
+            except OSError:
+                continue
 
-                if self.dest_addr is None:
-                    self.dest_addr = addr
-                elif addr != self.dest_addr: continue
+            if self.dest_addr is None:
+                self.dest_addr = addr
+            elif addr != self.dest_addr:
+                continue
 
-                if len(pkt) < _HDR.size: continue
-                seq, pt = _HDR.unpack_from(pkt)
-                last_pkt = time.monotonic()
+            if len(pkt) < UDP_HEADER_SIZE:
+                continue
 
-                if pt == CMD: continue
-                if pt == FIN:
-                    if write_buf:
-                        writer.write(bytes(write_buf)); write_buf.clear()
-                    ack = _HDR.pack(seq + 1, ACK)
-                    for _ in range(3): self._send(ack, addr)
-                    return total
-                if pt != DATA: continue
+            seq, ptype = _HDR.unpack_from(pkt)
+            last_pkt = time.monotonic()
 
-                data = pkt[_HDR.size:]
-                if seq == expected:
-                    write_buf.extend(data); total += len(data)
-                    expected += 1; cnt_ack += 1
-                    while expected in ooo:
-                        d = ooo.pop(expected)
-                        write_buf.extend(d); total += len(d)
-                        expected += 1; cnt_ack += 1
-                    if len(write_buf) >= _FLUSH:
-                        writer.write(bytes(write_buf)); write_buf.clear()
-                    if progress_callback:
-                        progress_callback(total)
-                elif seq > expected and seq < expected + win * 4:
-                    ooo.setdefault(seq, data)
-                    cnt_ack = _ACK_EVERY  # force ACK on OOO
+            if ptype == PacketType.CMD.value:
+                continue
 
-                if cnt_ack >= _ACK_EVERY or time.monotonic() - last_ack > 0.01:
-                    self._send(_HDR.pack(expected, ACK), addr)
-                    cnt_ack = 0; last_ack = time.monotonic()
+            if ptype == PacketType.FIN.value:
+                if write_buf:
+                    writer.write(bytes(write_buf))
+                    write_buf.clear()
+                ack = _HDR.pack(seq + 1, PacketType.ACK.value)
+                for _ in range(5):
+                    self._send(ack, addr)
+                return total
 
-                r2, _, _ = select.select([sock], [], [], 0)
-                if not r2: break
+            if ptype != PacketType.DATA.value:
+                continue
 
-            # Periodic ACK
-            if cnt_ack > 0 and time.monotonic() - last_ack > 0.005:
-                self._send(_HDR.pack(expected, ACK),
-                           self.dest_addr if self.dest_addr else addr)
-                cnt_ack = 0; last_ack = time.monotonic()
+            data = pkt[UDP_HEADER_SIZE:]
+
+            if seq == expected:
+                write_buf.extend(data)
+                total += len(data)
+                expected += 1
+                cnt_ack += 1
+
+                while expected in ooo:
+                    d = ooo.pop(expected)
+                    write_buf.extend(d)
+                    total += len(d)
+                    expected += 1
+                    cnt_ack += 1
+
+                if len(write_buf) >= FLUSH:
+                    writer.write(bytes(write_buf))
+                    write_buf.clear()
+
+                if progress_callback:
+                    progress_callback(total)
+
+            elif seq > expected and seq < expected + UDP_WINDOW_SIZE * 4:
+                ooo.setdefault(seq, data)
+                cnt_ack = _ACK_EVERY
+
+            if cnt_ack >= _ACK_EVERY or time.monotonic() - last_ack > 0.01:
+                self._send(_HDR.pack(expected, PacketType.ACK.value), addr)
+                cnt_ack = 0
+                last_ack = time.monotonic()
 
         if write_buf:
             writer.write(bytes(write_buf))
         return total
+        """Aggressive Reliable UDP для локальной сети.
+
+        Пакет 8KB, окно 4096 пакетов (≈32 MB), ACK раз в 64 пакета.
+        Заточено под максимальную скорость на низком RTT.
+        """
+
+        import socket
+        import struct
+        import time
+        import select
+        from typing import Optional, Tuple, Dict, Callable
+
+        from .protocol import (
+            UDP_PAYLOAD_SIZE,
+            UDP_HEADER_SIZE,
+            UDP_WINDOW_SIZE,
+            UDP_TIMEOUT,
+            PacketType,
+            UDP_RETRY_LIMIT,
+        )
+
+        _HDR = struct.Struct("!IB")
+        _BURST = 1024  # до 1024 пакетов за итерацию
+        _ACK_EVERY = 64  # ACK раз в 64 пакета
+        _READ_CHUNK = 4 * 1024 * 1024
+
+        class RUDPSocket:
+            def __init__(self, sock: socket.socket, dest_addr: Optional[Tuple[str, int]] = None):
+                self.sock = sock
+                self.dest_addr = dest_addr
+
+                for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+                    try:
+                        self.sock.setsockopt(socket.SOL_SOCKET, opt, 16 * 1024 * 1024)
+                    except OSError:
+                        pass
+
+            # ── low-level helpers ─────────────────────────────────
+
+            def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
+                return _HDR.pack(seq, ptype) + data
+
+            def _unpack(self, pkt: bytes):
+                if len(pkt) < UDP_HEADER_SIZE:
+                    return -1, -1, b""
+                s, t = _HDR.unpack_from(pkt)
+                return s, t, pkt[UDP_HEADER_SIZE:]
+
+            def _send(self, data: bytes, addr: Tuple[str, int]) -> bool:
+                for _ in range(4):
+                    try:
+                        self.sock.sendto(data, addr)
+                        return True
+                    except (BlockingIOError, InterruptedError):
+                        time.sleep(0.00001)
+                    except OSError:
+                        return False
+                return False
+
+            # ── командный канал ───────────────────────────────────
+
+            def send_command(self, text: str) -> Optional[str]:
+                if not self.dest_addr:
+                    raise RuntimeError("dest_addr not set")
+
+                addr = self.dest_addr
+                pkt = self._pack(0, PacketType.CMD.value, text.encode())
+
+                for _ in range(UDP_RETRY_LIMIT):
+                    self._send(pkt, addr)
+                    t0 = time.monotonic()
+                    while time.monotonic() - t0 < 0.5:
+                        r, _, _ = select.select([self.sock], [], [], 0.05)
+                        if not r:
+                            continue
+                        try:
+                            rp, ra = self.sock.recvfrom(65536)
+                        except OSError:
+                            break
+                        if ra != addr or len(rp) < UDP_HEADER_SIZE:
+                            continue
+                        s, t = _HDR.unpack_from(rp)
+                        if t != PacketType.CMD.value:
+                            continue
+                        data = rp[UDP_HEADER_SIZE:]
+                        msg = data.decode(errors="ignore")
+                        if msg == "ACK_CMD":
+                            continue
+                        return msg
+                return None
+
+            # ── send_stream: максимально агрессивная отправка ─────
+
+            def send_stream(self, reader, total_size: int,
+                            progress_callback: Callable[[int], None] = None) -> None:
+                if not self.dest_addr:
+                    raise RuntimeError("dest_addr not set")
+
+                addr = self.dest_addr
+                sock = self.sock
+                sendto = sock.sendto
+
+                base = 0
+                next_seq = 0
+                packets: Dict[int, bytes] = {}
+                cursor = 0
+                eof = False
+                last_ack = time.monotonic()
+                win = UDP_WINDOW_SIZE
+                last_prog = 0
+
+                while cursor < total_size or base < next_seq:
+                    # 1. Заполняем окно
+                    can_send = min(_BURST, base + win - next_seq)
+                    n = 0
+                    while not eof and n < can_send:
+                        chunk = reader.read(UDP_PAYLOAD_SIZE)
+                        if not chunk:
+                            eof = True
+                            cursor = total_size
+                            break
+                        pkt = self._pack(next_seq, PacketType.DATA.value, chunk)
+                        packets[next_seq] = pkt
+                        try:
+                            sendto(pkt, addr)
+                        except (BlockingIOError, InterruptedError):
+                            time.sleep(0.00001)
+                            try:
+                                sendto(pkt, addr)
+                            except OSError:
+                                pass
+                        except OSError:
+                            pass
+                        next_seq += 1
+                        cursor += len(chunk)
+                        n += 1
+
+                    if progress_callback and cursor - last_prog > max(total_size // 100, 1):
+                        progress_callback(min(cursor, total_size))
+                        last_prog = cursor
+
+                    # 2. Читаем ACK'и
+                    moved = False
+                    while True:
+                        r, _, _ = select.select([sock], [], [], 0)
+                        if not r:
+                            break
+                        try:
+                            ap, _ = sock.recvfrom(64)
+                        except OSError:
+                            break
+                        if len(ap) < UDP_HEADER_SIZE:
+                            continue
+                        s, t = _HDR.unpack_from(ap)
+                        if t != PacketType.ACK.value:
+                            continue
+                        if s > base:
+                            for k in range(base, s):
+                                packets.pop(k, None)
+                            base = s
+                            last_ack = time.monotonic()
+                            moved = True
+
+                    if moved:
+                        continue
+
+                    # 3. Таймаут — переотправка части окна
+                    now = time.monotonic()
+                    if packets and now - last_ack > UDP_TIMEOUT:
+                        cnt = 0
+                        for k in sorted(packets.keys()):
+                            try:
+                                sendto(packets[k], addr)
+                            except OSError:
+                                pass
+                            cnt += 1
+                            if cnt >= 512:
+                                break
+                        last_ack = now
+                    else:
+                        time.sleep(0.0001)
+
+                # FIN
+                fin_seq = next_seq
+                fin_pkt = self._pack(fin_seq, PacketType.FIN.value)
+                for _ in range(25):
+                    self._send(fin_pkt, addr)
+                    r, _, _ = select.select([sock], [], [], 0.2)
+                    if not r:
+                        continue
+                    try:
+                        ap, _ = sock.recvfrom(64)
+                    except OSError:
+                        continue
+                    if len(ap) < UDP_HEADER_SIZE:
+                        continue
+                    s, t = _HDR.unpack_from(ap)
+                    if t == PacketType.ACK.value and s == fin_seq + 1:
+                        break
+
+            # ── recv_stream: быстрый приём ────────────────────────
+
+            def recv_stream(self, writer, total_size: int = 0,
+                            progress_callback: Callable[[int], None] = None) -> int:
+                sock = self.sock
+
+                expected = 0
+                ooo: Dict[int, bytes] = {}
+                total = 0
+                last_pkt = time.monotonic()
+                last_ack = time.monotonic()
+                cnt_ack = 0
+                write_buf = bytearray()
+                FLUSH = 1024 * 1024
+
+                while True:
+                    now = time.monotonic()
+                    if now - last_pkt > 30.0:
+                        break
+
+                    r, _, _ = select.select([sock], [], [], 0.05)
+                    if not r:
+                        if now - last_ack > 0.05 and self.dest_addr is not None:
+                            self._send(_HDR.pack(expected, PacketType.ACK.value), self.dest_addr)
+                            last_ack = now
+                        continue
+
+                    try:
+                        pkt, addr = sock.recvfrom(65536)
+                    except OSError:
+                        continue
+
+                    if self.dest_addr is None:
+                        self.dest_addr = addr
+                    elif addr != self.dest_addr:
+                        continue
+
+                    if len(pkt) < UDP_HEADER_SIZE:
+                        continue
+
+                    seq, ptype = _HDR.unpack_from(pkt)
+                    last_pkt = time.monotonic()
+
+                    if ptype == PacketType.CMD.value:
+                        continue
+
+                    if ptype == PacketType.FIN.value:
+                        if write_buf:
+                            writer.write(bytes(write_buf))
+                            write_buf.clear()
+                        ack = _HDR.pack(seq + 1, PacketType.ACK.value)
+                        for _ in range(5):
+                            self._send(ack, addr)
+                        return total
+
+                    if ptype != PacketType.DATA.value:
+                        continue
+
+                    data = pkt[UDP_HEADER_SIZE:]
+
+                    if seq == expected:
+                        write_buf.extend(data)
+                        total += len(data)
+                        expected += 1
+                        cnt_ack += 1
+
+                        while expected in ooo:
+                            d = ooo.pop(expected)
+                            write_buf.extend(d)
+                            total += len(d)
+                            expected += 1
+                            cnt_ack += 1
+
+                        if len(write_buf) >= FLUSH:
+                            writer.write(bytes(write_buf))
+                            write_buf.clear()
+
+                        if progress_callback:
+                            progress_callback(total)
+
+                    elif seq > expected and seq < expected + UDP_WINDOW_SIZE * 4:
+                        ooo.setdefault(seq, data)
+                        cnt_ack = _ACK_EVERY
+
+                    if cnt_ack >= _ACK_EVERY or time.monotonic() - last_ack > 0.01:
+                        self._send(_HDR.pack(expected, PacketType.ACK.value), addr)
+                        cnt_ack = 0
+                        last_ack = time.monotonic()
+
+                if write_buf:
+                    writer.write(bytes(write_buf))
+                return total
