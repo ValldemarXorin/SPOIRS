@@ -1,4 +1,4 @@
-"""Управление файлами и сессиями передачи."""
+"""Менеджер файлов и сессий передачи."""
 
 import time
 from dataclasses import dataclass, field
@@ -8,18 +8,16 @@ from pathlib import Path
 
 @dataclass
 class TransferSession:
-    """Информация о сессии передачи файла."""
-
+    """Сессия передачи файла."""
     filename: str
     total_size: int
     transferred: int
     start_time: float
-    client_id: str  # IP:Port string
-    is_upload: bool  # True если клиент загружает НА сервер
-
+    client_id: str       # IP:Port string
+    is_upload: bool = True
     temp_path: Optional[str] = None
-    file_handle: Optional[Any] = None  # Открытый файл
-    sock: Optional[Any] = None  # Сокет клиента (для TCP)
+    file_handle: Optional[Any] = None
+    sock: Optional[Any] = None  # TCP socket
 
     # UDP upload (server receive)
     expected_seq: int = 0
@@ -43,7 +41,7 @@ class TransferSession:
 
 
 class FileManager:
-    """Менеджер файлов сервера."""
+    """Менеджер хранения файлов и сессий."""
 
     def __init__(self, storage_dir: str = "./server_files"):
         self.storage_dir = Path(storage_dir)
@@ -75,9 +73,9 @@ class FileManager:
         return path.stat().st_size if path.exists() else 0
 
     def create_session(self, filename: str, total_size: int,
-                       client_id: str, is_upload: bool, sock=None) -> Optional[TransferSession]:
-        """Создаёт и регистрирует новую сессию."""
-
+                       client_id: str, is_upload: bool,
+                       sock=None) -> Optional[TransferSession]:
+        """Создаёт сессию передачи файла."""
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
 
         session = TransferSession(
@@ -93,10 +91,8 @@ class FileManager:
             udp_last_ack_time=time.time(),
         )
 
-        # Открываем файл сразу, чтобы не делать это в цикле
         try:
             if is_upload:
-                # Пока без докачки/резюма на сервере (для простоты)
                 session.file_handle = open(temp_path, 'wb')
             else:
                 path = self.get_file_path(filename)
@@ -112,20 +108,17 @@ class FileManager:
         return self.sessions.get(client_id)
 
     def close_session(self, client_id: str) -> None:
-        """Закрывает дескриптор файла и удаляет сессию."""
-
+        """Закрывает сессию без перемещения файла."""
         session = self.sessions.get(client_id)
         if session and session.file_handle:
             try:
                 session.file_handle.close()
             except Exception:
                 pass
-
         self.sessions.pop(client_id, None)
 
     def complete_session(self, client_id: str) -> None:
-        """Успешное завершение сессии (перенос файла)."""
-
+        """Завершает сессию: закрывает файл и перемещает из temp в storage."""
         session = self.sessions.get(client_id)
         if not session:
             return

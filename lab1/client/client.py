@@ -144,6 +144,8 @@ class FileTransferClient:
 
         if use_udp:
             try:
+                # Небольшая пауза, чтобы сервер успел подготовить сессию
+                time.sleep(0.05)
                 with open(path, "rb") as f:
                     f.seek(offset)
                     rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
@@ -154,7 +156,7 @@ class FileTransferClient:
                     )
                 sent = size
             except Exception as e:
-                print(f"UDP Upload error: {e}")
+                print(f"\nUDP Upload error: {e}")
                 sent = 0
 
             elapsed = time.time() - start_time
@@ -247,6 +249,8 @@ class FileTransferClient:
             mode = "ab" if offset > 0 else "wb"
 
             try:
+                # Небольшая пауза, чтобы сервер начал отправку
+                time.sleep(0.05)
                 rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
                 with open(filepath, mode) as f:
                     received = rudp.recv_stream(
@@ -256,7 +260,7 @@ class FileTransferClient:
                     )
 
             except Exception as e:
-                print(f"UDP Download error: {e}")
+                print(f"\nUDP Download error: {e}")
                 received = 0
 
         else:
@@ -347,7 +351,11 @@ class InteractiveClient:
         self.last_download: Optional[Tuple[str, int, bool]] = None
 
     def run(self) -> None:
-        self.client.connect()
+        # FIX: Если не удалось подключиться — не показываем меню
+        if not self.client.connect():
+            print("Could not connect to server. Exiting.")
+            return
+
         self._print_help()
 
         try:
@@ -370,12 +378,12 @@ class InteractiveClient:
 
     def _print_help(self) -> None:
         print("\nAvailable commands:")
-        print(" ECHO [--udp] - Echo text")
-        print(" TIME [--udp] - Get time")
-        print(" UPLOAD [--udp] - Upload file")
-        print(" DOWNLOAD [--udp] - Download file")
-        print(" RESUME - Resume last transfer")
-        print(" QUIT - Disconnect")
+        print("  ECHO <text> [--udp] - Echo text")
+        print("  TIME [--udp]        - Get time")
+        print("  UPLOAD <file> [--udp] - Upload file")
+        print("  DOWNLOAD <file> [--udp] - Download file")
+        print("  RESUME              - Resume last transfer")
+        print("  QUIT                - Disconnect")
 
     def _process_input(self, cmd: str) -> bool:
         parts = cmd.split()
