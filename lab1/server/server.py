@@ -1,9 +1,20 @@
-"""TCP/UDP сервер.
+"""TCP/UDP сервер с поддержкой пула процессов (ЛР4, вариант 12).
 
-UDP upload: DATA/FIN/ACK в основном select-цикле.
-UDP download: send_stream в отдельном потоке через выделенный сокет.
+Вариант 12:
+- протокол TCP,
+- пул процессов,
+- механизм защиты: параллельный вызов (несколько процессов
+  параллельно делают accept на одном слушающем сокете).
+
+Архитектура:
+- master-процесс создаёт слушающий TCP-сокет и UDP-сокет,
+  затем порождает N рабочих процессов;
+- каждый рабочий процесс создаёт свой TCPServer с уже открытыми
+  сокетами и крутит тот же _loop (select-мультиплексор);
+- UDP-часть (upload/download) остаётся как в твоей реализации.
 """
 
+import os
 import socket
 import select
 import signal
@@ -12,11 +23,19 @@ import sys
 import time
 import threading
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
+
+from multiprocessing import Process
 
 from common.protocol import (
-    CommandType, PacketType, parse_command, format_response,
-    COMMAND_TERMINATOR, UDP_WINDOW_SIZE, Response, UDP_ACK_INTERVAL,
+    CommandType,
+    PacketType,
+    parse_command,
+    format_response,
+    COMMAND_TERMINATOR,
+    UDP_WINDOW_SIZE,
+    Response,
+    UDP_ACK_INTERVAL,
 )
 from common.socket_utils import create_server_socket, send_all, create_udp_socket
 from common.rudp import RUDPSocket, ConnectionLostError
@@ -26,55 +45,61 @@ from server.file_manager import FileManager, TransferSession
 TCP_CHUNK = 64 * 1024
 _HDR = struct.Struct("!IB")
 
+# параметры пула процессов
+WORKER_MIN = 3
+WORKER_MAX = 5
 
-def _ts():
+
+def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
 class TCPServer:
-    def __init__(self, host="0.0.0.0", port=9000):
+    """Логика сервера (как в твоей ЛР2/3), без создания собственных сокетов."""
+
+    def __init__(
+        self,
+        tcp_sock: socket.socket,
+        udp_sock: socket.socket,
+        host: str = "0.0.0.0",
+        port: int = 9000,
+    ) -> None:
         self.host = host
         self.port = port
         self.running = False
-        self.server_socket_tcp: Optional[socket.socket] = None
-        self.server_socket_udp: Optional[socket.socket] = None
+
+        self.server_socket_tcp: socket.socket = tcp_sock
+        self.server_socket_udp: socket.socket = udp_sock
+
         self.file_manager = FileManager()
         self.command_handler = CommandHandler(self.file_manager)
-        self.inputs = []
-        self.outputs = []
+
+        self.inputs: List[socket.socket] = [self.server_socket_tcp, self.server_socket_udp]
+        self.outputs: List[socket.socket] = []
         self.tcp_buffers: Dict[int, bytes] = {}
 
-    def start(self):
+    # ── lifecycle ──────────────────────────────────────────
+
+    def start(self) -> None:
+        """Запуск основного цикла в рабочем процессе."""
         self._setup_signals()
-
-        self.server_socket_tcp = create_server_socket(self.host, self.port)
-        self.server_socket_tcp.setblocking(False)
-        self.inputs.append(self.server_socket_tcp)
-
-        self.server_socket_udp = create_udp_socket()
-        self.server_socket_udp.bind((self.host, self.port))
-        self.server_socket_udp.setblocking(False)
-        self.inputs.append(self.server_socket_udp)
-
         self.running = True
+
         try:
             ip = socket.gethostbyname(socket.gethostname())
         except OSError:
             ip = "127.0.0.1"
         bind_ip = ip if self.host in ("0.0.0.0", "") else self.host
-        print(f"[{_ts()}] ===== Server on {bind_ip}:{self.port} (TCP+UDP) =====")
+        print(
+            f"[{_ts()}] [PID {os.getpid()}] Worker started on {bind_ip}:{self.port} (TCP+UDP)"
+        )
         self._loop()
 
-    def _setup_signals(self):
-        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
-        signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
+    def _setup_signals(self) -> None:
+        signal.signal(signal.SIGINT, lambda *_: self.stop())
+        signal.signal(signal.SIGTERM, lambda *_: self.stop())
 
-    def _shutdown(self):
-        self.running = False
-        self.stop()
-        sys.exit(0)
-
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
         for s in list(self.inputs):
             try:
@@ -82,16 +107,20 @@ class TCPServer:
             except OSError:
                 pass
 
-    def _loop(self):
+    # ── main loop ─────────────────────────────────────────
+
+    def _loop(self) -> None:
         while self.running:
             try:
                 self.outputs = [
-                    s.sock for s in self.file_manager.sessions.values()
+                    s.sock
+                    for s in self.file_manager.sessions.values()
                     if not s.is_upload and s.sock is not None and s.sock in self.inputs
                 ]
                 readable, writable, exceptional = select.select(
                     self.inputs, self.outputs, self.inputs, 0.005
                 )
+
                 for s in readable:
                     if s is self.server_socket_tcp:
                         self._tcp_accept()
@@ -99,32 +128,36 @@ class TCPServer:
                         self._udp_read()
                     else:
                         self._tcp_read(s)
+
                 for s in writable:
                     self._tcp_write(s)
+
                 for s in exceptional:
                     self._remove(s)
+
                 self._udp_send_acks()
             except Exception as e:
                 if self.running:
-                    print(f"[{_ts()}] Loop error: {e}")
+                    print(f"[{_ts()}] [PID {os.getpid()}] Loop error: {e}")
 
     # ── TCP ───────────────────────────────────────────────
 
-    def _tcp_accept(self):
+    def _tcp_accept(self) -> None:
         try:
             cs, addr = self.server_socket_tcp.accept()
         except OSError:
             return
-        print(f"[{_ts()}] TCP Connect: {addr[0]}:{addr[1]}")
+        print(f"[{_ts()}] [PID {os.getpid()}] TCP Connect: {addr[0]}:{addr[1]}")
         cs.setblocking(False)
         self.inputs.append(cs)
         self.tcp_buffers[cs.fileno()] = b""
         send_all(cs, b"220 Welcome\n")
 
-    def _tcp_read(self, sock):
+    def _tcp_read(self, sock: socket.socket) -> None:
         cid = str(sock.fileno())
         session = self.file_manager.get_session(cid)
 
+        # TCP upload
         if session and session.is_upload:
             try:
                 chunk = sock.recv(TCP_CHUNK)
@@ -146,12 +179,16 @@ class TCPServer:
                 br = self.file_manager.calculate_bitrate(session)
                 bs = self.file_manager.format_bitrate(br)
                 self.file_manager.complete_session(cid)
-                send_all(sock, format_response(
-                    Response(True, f"Received {session.transferred} bytes. {bs}")
-                ))
+                send_all(
+                    sock,
+                    format_response(
+                        Response(True, f"Received {session.transferred} bytes. {bs}")
+                    ),
+                )
                 print(f"[{_ts()}] TCP Upload done ({bs})")
             return
 
+        # командный канал
         try:
             data = sock.recv(4096)
         except OSError:
@@ -169,13 +206,17 @@ class TCPServer:
             cmd = parse_command(raw, "TCP")
             print(f"[{_ts()}] TCP CMD [{cid}]: {raw.strip()}")
             resp = self.command_handler.execute(cmd, sock, None, None)
-            transfer_cmds = {CommandType.UPLOAD, CommandType.DOWNLOAD,
-                             CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD}
+            transfer_cmds = {
+                CommandType.UPLOAD,
+                CommandType.DOWNLOAD,
+                CommandType.RESUME_UPLOAD,
+                CommandType.RESUME_DOWNLOAD,
+            }
             if cmd.type not in transfer_cmds or not resp.success:
                 send_all(sock, format_response(resp))
         self.tcp_buffers[fd] = buf
 
-    def _tcp_write(self, sock):
+    def _tcp_write(self, sock: socket.socket) -> None:
         cid = str(sock.fileno())
         session = self.file_manager.get_session(cid)
         if not (session and not session.is_upload and session.file_handle):
@@ -202,12 +243,12 @@ class TCPServer:
             self.file_manager.complete_session(cid)
             print(f"[{_ts()}] TCP Download done ({bs})")
 
-    # ── UDP ───────────────────────────────────────────────
+    # ── UDP (оставлено по сути как у тебя) ────────────────
 
-    def _udp_read(self):
+    def _udp_read(self) -> None:
         if not self.server_socket_udp:
             return
-        # Drain all available packets
+
         for _ in range(8192):
             try:
                 pkt, addr = self.server_socket_udp.recvfrom(65536)
@@ -226,8 +267,7 @@ class TCPServer:
             elif ptype == PacketType.FIN.value:
                 self._udp_fin(cid, seq, addr)
 
-    def _udp_cmd(self, cid, seq, data, addr):
-        # ACK command
+    def _udp_cmd(self, cid, seq, data, addr) -> None:
         ack = _HDR.pack(seq, PacketType.CMD.value) + b"ACK_CMD"
         try:
             self.server_socket_udp.sendto(ack, addr)
@@ -243,8 +283,12 @@ class TCPServer:
 
         resp = self.command_handler.execute(cmd, None, self.server_socket_udp, addr)
 
-        transfer_cmds = {CommandType.UPLOAD, CommandType.DOWNLOAD,
-                         CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD}
+        transfer_cmds = {
+            CommandType.UPLOAD,
+            CommandType.DOWNLOAD,
+            CommandType.RESUME_UPLOAD,
+            CommandType.RESUME_DOWNLOAD,
+        }
 
         if cmd.type in transfer_cmds:
             if not resp.success:
@@ -262,7 +306,7 @@ class TCPServer:
             except OSError:
                 pass
 
-    def _udp_data(self, cid, seq, data, addr):
+    def _udp_data(self, cid, seq, data, addr) -> None:
         session = self.file_manager.get_session(cid)
         if not session or not session.is_upload:
             return
@@ -290,14 +334,13 @@ class TCPServer:
         elif seq > session.expected_seq:
             if seq < session.expected_seq + UDP_WINDOW_SIZE * 2:
                 session.udp_recv_buffer.setdefault(seq, data)
-            # NACK
             nack = _HDR.pack(session.expected_seq, PacketType.NACK.value)
             try:
                 self.server_socket_udp.sendto(nack, addr)
             except OSError:
                 pass
 
-    def _udp_fin(self, cid, seq, addr):
+    def _udp_fin(self, cid, seq, addr) -> None:
         fin_ack = _HDR.pack(seq + 1, PacketType.ACK.value)
         for _ in range(5):
             try:
@@ -311,13 +354,12 @@ class TCPServer:
             self.file_manager.complete_session(cid)
             print(f"[{_ts()}] UDP Upload done: {session.filename} ({bs})")
 
-    def _udp_send_acks(self):
-        """Частые ACK для upload сессий — sender не тормозит."""
+    def _udp_send_acks(self) -> None:
         now = time.time()
         for cid, sess in list(self.file_manager.sessions.items()):
             if not sess.is_upload or ":" not in cid or cid.isdigit():
                 continue
-            if now - sess.udp_last_ack_time < 0.001:  # каждые 1ms
+            if now - sess.udp_last_ack_time < UDP_ACK_INTERVAL:
                 continue
             parts = cid.rsplit(":", 1)
             if len(parts) != 2:
@@ -333,7 +375,7 @@ class TCPServer:
                 pass
             sess.udp_last_ack_time = now
 
-    def _start_udp_download(self, cid, addr):
+    def _start_udp_download(self, cid, addr) -> None:
         session = self.file_manager.get_session(cid)
         if not session or session.is_upload:
             return
@@ -347,12 +389,13 @@ class TCPServer:
         def worker():
             dl_sock = create_udp_socket()
             dl_sock.setblocking(False)
-            dl_sock.bind(('', 0))
+            dl_sock.bind(("", 0))
             dl_port = dl_sock.getsockname()[1]
 
-            print(f"[{_ts()}] UDP Download: {filename} → {addr[0]}:{addr[1]} port {dl_port}")
+            print(
+                f"[{_ts()}] UDP Download: {filename} → {addr[0]}:{addr[1]} port {dl_port}"
+            )
 
-            # Отправляем порт клиенту (надёжно)
             port_pkt = _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {dl_port}".encode()
             for _ in range(15):
                 try:
@@ -361,7 +404,6 @@ class TCPServer:
                     pass
                 time.sleep(0.02)
 
-            # Ждём hello
             client_dl_addr = None
             t0 = time.monotonic()
             while time.monotonic() - t0 < 10.0:
@@ -385,8 +427,11 @@ class TCPServer:
             try:
                 rudp = RUDPSocket(dl_sock, dest_addr=client_dl_addr)
                 rudp.send_stream(
-                    file_handle, total_size=total_size,
-                    progress_callback=lambda s: self._update_dl(cid, s, session),
+                    file_handle,
+                    total_size=total_size,
+                    progress_callback=lambda s: self._update_dl(
+                        cid, s, session
+                    ),
                 )
                 session.transferred = total_size
                 br = self.file_manager.calculate_bitrate(session)
@@ -402,20 +447,20 @@ class TCPServer:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_dl(self, cid, transferred, session):
+    def _update_dl(self, cid, transferred, session) -> None:
         session.transferred = transferred
         session.last_activity = time.time()
         self._log(cid, session, "UDP Download")
 
-    def _log(self, cid, session, op):
+    def _log(self, cid, session, op) -> None:
         if session.total_size <= 0:
             return
         pct = int(session.transferred / session.total_size * 100)
-        if pct >= session._last_pct + 10 or pct == 100:
+        if pct >= getattr(session, "_last_pct", -10) + 10 or pct == 100:
             session._last_pct = pct
             print(f"[{_ts()}] {op}: {session.filename} [{cid}] — {pct}%")
 
-    def _remove(self, sock):
+    def _remove(self, sock: socket.socket) -> None:
         try:
             addr = sock.getpeername()
             print(f"[{_ts()}] Disconnected: {addr[0]}:{addr[1]}")
@@ -432,3 +477,88 @@ class TCPServer:
             sock.close()
         except OSError:
             pass
+
+
+# ── process-pool manager для варианта 12 ─────────────────
+
+
+def _run_worker(tcp_fd: int, udp_fd: int, host: str, port: int) -> None:
+    """Точка входа рабочего процесса."""
+    tcp_sock = socket.fromfd(tcp_fd, socket.AF_INET, socket.SOCK_STREAM)
+    udp_sock = socket.fromfd(udp_fd, socket.AF_INET, socket.SOCK_DGRAM)
+    srv = TCPServer(tcp_sock, udp_sock, host=host, port=port)
+    srv.start()
+
+
+def main() -> None:
+    host = "0.0.0.0"
+    port = 9000
+
+    tcp_sock = create_server_socket(host, port)
+    tcp_sock.setblocking(False)
+
+    udp_sock = create_udp_socket()
+    udp_sock.bind((host, port))
+    udp_sock.setblocking(False)
+
+    tcp_fd = tcp_sock.fileno()
+    udp_fd = udp_sock.fileno()
+
+    workers: List[Process] = []
+
+    def spawn_worker() -> None:
+        p = Process(
+            target=_run_worker,
+            args=(tcp_fd, udp_fd, host, port),
+            daemon=False,
+        )
+        p.start()
+        workers.append(p)
+        print(f"[{_ts()}] Spawned worker PID={p.pid}")
+
+    for _ in range(WORKER_MIN):
+        spawn_worker()
+
+    def handle_term(signum, frame) -> None:
+        print(f"[{_ts()}] Master received signal {signum}, stopping...")
+        for p in workers:
+            if p.is_alive():
+                p.terminate()
+        for p in workers:
+            p.join(timeout=2.0)
+        try:
+            tcp_sock.close()
+            udp_sock.close()
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_term)
+    signal.signal(signal.SIGTERM, handle_term)
+
+    try:
+        while True:
+            alive: List[Process] = []
+            for p in workers:
+                if p.is_alive():
+                    alive.append(p)
+                else:
+                    print(f"[{_ts()}] Worker PID={p.pid} exited with {p.exitcode}")
+            workers = alive
+
+            if len(workers) < WORKER_MIN:
+                spawn_worker()
+            elif len(workers) > WORKER_MAX:
+                extra = workers[WORKER_MAX:]
+                workers = workers[:WORKER_MAX]
+                for p in extra:
+                    if p.is_alive():
+                        p.terminate()
+
+            time.sleep(1.0)
+    finally:
+        handle_term(signal.SIGTERM, None)
+
+
+if __name__ == "__main__":
+    main()
