@@ -3,6 +3,7 @@
 import socket
 import time
 import sys
+import select  # Добавлен недостающий импорт
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -238,9 +239,11 @@ class FileTransferClient:
 
                 # Ждем порт от сервера
                 port_info = None
-                timeout = time.time() + 10
+                timeout = time.time() + 15  # Увеличен таймаут
+                print("Waiting for server download port...")
+
                 while time.time() < timeout:
-                    r, _, _ = select.select([self.udp_socket], [], [], 0.1)
+                    r, _, _ = select.select([self.udp_socket], [], [], 0.5)
                     if r:
                         try:
                             data, addr = self.udp_socket.recvfrom(65536)
@@ -248,9 +251,11 @@ class FileTransferClient:
                             if "DOWNLOAD_PORT" in msg:
                                 port = int(msg.split()[1])
                                 port_info = (self.host, port)
+                                print(f"Got download port: {port}")
                                 break
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"Error receiving port: {e}")
+                            continue
 
                 if not port_info:
                     print("No download port from server")
@@ -258,7 +263,9 @@ class FileTransferClient:
                     return False
 
                 # Отправляем hello
+                print(f"Sending hello to {port_info}")
                 dl_sock.sendto(b"HELLO", port_info)
+                time.sleep(0.1)  # Небольшая пауза
 
                 rudp = RUDPSocket(dl_sock, dest_addr=port_info)
                 with open(fp, mode) as f:
@@ -278,7 +285,7 @@ class FileTransferClient:
 
         self._stats("Download", received, time.time() - t0)
         if received != fsize:
-            print("Incomplete")
+            print(f"Incomplete: received {received} of {fsize} bytes")
             return False
         return True
 
