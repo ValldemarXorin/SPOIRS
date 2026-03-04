@@ -1,12 +1,3 @@
-"""TCP/UDP сервер с поддержкой пула процессов (ЛР4, вариант 12).
-
-Вариант 12:
-- протокол TCP,
-- пул процессов (os.fork),
-- механизм защиты: параллельный вызов — несколько процессов
-  параллельно делают accept на одном слушающем сокете.
-"""
-
 import os
 import socket
 import select
@@ -234,7 +225,8 @@ class TCPServer:
     def _udp_read(self) -> None:
         if not self.server_socket_udp:
             return
-        for _ in range(8192):
+        # Читаем все доступные пакеты за раз
+        for _ in range(16384):  # Увеличено количество за раз
             try:
                 pkt, addr = self.server_socket_udp.recvfrom(65536)
             except (BlockingIOError, OSError):
@@ -317,7 +309,8 @@ class TCPServer:
 
         elif seq > session.expected_seq:
             if seq < session.expected_seq + UDP_WINDOW_SIZE * 2:
-                session.udp_recv_buffer.setdefault(seq, data)
+                session.udp_recv_buffer[seq] = data
+            # Отправляем NACK для пропущенного пакета
             nack = _HDR.pack(session.expected_seq, PacketType.NACK.value)
             try:
                 self.server_socket_udp.sendto(nack, addr)
@@ -326,11 +319,12 @@ class TCPServer:
 
     def _udp_fin(self, cid, seq, addr) -> None:
         fin_ack = _HDR.pack(seq + 1, PacketType.ACK.value)
-        for _ in range(5):
+        for _ in range(10):  # Увеличено количество попыток
             try:
                 self.server_socket_udp.sendto(fin_ack, addr)
             except OSError:
                 pass
+            time.sleep(0.01)  # Небольшая пауза между попытками
         session = self.file_manager.get_session(cid)
         if session and session.is_upload:
             br = self.file_manager.calculate_bitrate(session)
@@ -343,7 +337,7 @@ class TCPServer:
         for cid, sess in list(self.file_manager.sessions.items()):
             if not sess.is_upload or ":" not in cid or cid.isdigit():
                 continue
-            if now - sess.udp_last_ack_time < UDP_ACK_INTERVAL:
+            if now - sess.udp_last_ack_time < UDP_ACK_INTERVAL * 0.1:  # Более частая отправка ACK
                 continue
             parts = cid.rsplit(":", 1)
             if len(parts) != 2:
@@ -381,17 +375,17 @@ class TCPServer:
             port_pkt = (
                 _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {dl_port}".encode()
             )
-            for _ in range(15):
+            for _ in range(30):  # Увеличено количество попыток
                 try:
                     self.server_socket_udp.sendto(port_pkt, addr)
                 except OSError:
                     pass
-                time.sleep(0.02)
+                time.sleep(0.05)  # Увеличена пауза
 
             client_dl_addr = None
             t0 = time.monotonic()
-            while time.monotonic() - t0 < 10.0:
-                r, _, _ = select.select([dl_sock], [], [], 0.1)
+            while time.monotonic() - t0 < 15.0:  # Увеличен таймаут
+                r, _, _ = select.select([dl_sock], [], [], 0.2)
                 if r:
                     try:
                         _, ca = dl_sock.recvfrom(65536)

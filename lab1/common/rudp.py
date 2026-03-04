@@ -1,4 +1,4 @@
-"""Reliable UDP — простой и быстрый.
+"""Reliable UDP — простой и быстрый, с поддержкой Windows/Linux.
 
 Без сложного congestion control. Для LAN/localhost где потерь мало.
 
@@ -19,6 +19,7 @@ import socket
 import struct
 import time
 import select
+import sys
 from typing import Optional, Tuple, Dict, Callable, List
 
 from .protocol import (
@@ -39,7 +40,7 @@ _FIN_RETRIES = 25
 _FIN_TIMEOUT = 0.3
 
 # Сколько пакетов отправлять за один burst перед проверкой ACK
-_SEND_BURST = 512
+_SEND_BURST = 256  # Уменьшено для лучшей совместимости с Windows
 
 
 class ConnectionLostError(Exception):
@@ -51,31 +52,42 @@ class RUDPSocket:
                  dest_addr: Optional[Tuple[str, int]] = None):
         self.sock = sock
         self.dest_addr = dest_addr
+        # Увеличиваем буферы для Windows
         for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try:
-                self.sock.setsockopt(socket.SOL_SOCKET, opt, 8 * 1024 * 1024)
-            except OSError:
-                pass
+            for size in [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024]:
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, opt, size)
+                    break
+                except OSError:
+                    continue
+
+        # Для Windows устанавливаем неблокирующий режим
+        if sys.platform == "win32":
+            self.sock.setblocking(False)
 
     def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
         return _HDR.pack(seq, ptype) + data
 
     def _send_raw(self, data: bytes, addr: Tuple[str, int]) -> bool:
-        for attempt in range(3):
+        for attempt in range(5):  # Увеличено количество попыток для Windows
             try:
                 self.sock.sendto(data, addr)
                 return True
             except BlockingIOError:
                 # Буфер отправки полный — короткая пауза
-                time.sleep(0.0001)
+                time.sleep(0.001)  # Увеличена пауза для Windows
             except InterruptedError:
                 continue
             except ConnectionRefusedError:
                 raise ConnectionLostError("Connection refused (REJECT)")
             except OSError as e:
                 err = str(e).lower()
-                if "forcibly closed" in err or "reset" in err:
+                if "forcibly closed" in err or "reset" in err or "10054" in str(e):
                     raise ConnectionLostError(f"Connection reset: {e}")
+                # Для Windows игнорируем некоторые ошибки
+                if sys.platform == "win32" and "10035" in str(e):  # WSAEWOULDBLOCK
+                    time.sleep(0.001)
+                    continue
                 return False
         return False
 
@@ -94,13 +106,13 @@ class RUDPSocket:
                 return None
 
             t0 = time.monotonic()
-            while time.monotonic() - t0 < 0.5:
-                r, _, _ = select.select([self.sock], [], [], 0.05)
+            while time.monotonic() - t0 < 1.0:  # Увеличен таймаут для Windows
+                r, _, _ = select.select([self.sock], [], [], 0.1)
                 if not r:
                     continue
                 try:
                     rp, ra = self.sock.recvfrom(65536)
-                except OSError:
+                except (BlockingIOError, OSError):
                     break
                 if ra != addr or len(rp) < _HDR_SIZE:
                     continue
@@ -133,6 +145,7 @@ class RUDPSocket:
         eof = False
         last_ack_time = time.monotonic()
         last_prog = 0
+        retransmit_count = 0
 
         try:
             while cursor < total_size or base < next_seq:
@@ -153,12 +166,11 @@ class RUDPSocket:
 
                     try:
                         sendto(pkt, addr)
-                    except BlockingIOError:
-                        # Буфер полный — обработаем ACK и продолжим
-                        break
-                    except ConnectionRefusedError:
-                        raise ConnectionLostError("Connection refused")
-                    except OSError:
+                    except (BlockingIOError, OSError) as e:
+                        if sys.platform == "win32" and "10035" in str(e):
+                            # WSAEWOULDBLOCK - буфер полный
+                            time.sleep(0.001)
+                            break
                         break
 
                     next_seq += 1
@@ -173,13 +185,14 @@ class RUDPSocket:
 
                 # ── 2. Читаем ACK (non-blocking) ──
                 moved = False
-                while True:
+                # Читаем все доступные ACK
+                for _ in range(100):  # Ограничиваем количество за раз
                     r, _, _ = select.select([sock], [], [], 0)
                     if not r:
                         break
                     try:
                         ap, _ = sock.recvfrom(16)
-                    except OSError:
+                    except (BlockingIOError, OSError):
                         break
                     if len(ap) < _HDR_SIZE:
                         continue
@@ -192,6 +205,7 @@ class RUDPSocket:
                         base = s
                         last_ack_time = time.monotonic()
                         moved = True
+                        retransmit_count = 0
 
                     elif t == PacketType.NACK.value and s in packets:
                         # Selective retransmit
@@ -199,6 +213,7 @@ class RUDPSocket:
                             sendto(packets[s], addr)
                         except OSError:
                             pass
+                        retransmit_count = 0
 
                 # Если окно двинулось — сразу шлём ещё
                 if moved:
@@ -215,17 +230,24 @@ class RUDPSocket:
                 if packets and now - last_ack_time > UDP_TIMEOUT:
                     # Таймаут: переотправляем начало окна
                     cnt = 0
-                    for k in sorted(packets.keys()):
+                    retransmit_count += 1
+                    if retransmit_count > 10:  # Слишком много ретрансмиссий
+                        raise ConnectionLostError("Too many retransmissions")
+
+                    # Отправляем пакеты с начала окна
+                    for k in sorted(packets.keys())[:128]:  # Ограничиваем количество
                         try:
                             sendto(packets[k], addr)
                         except OSError:
                             pass
                         cnt += 1
-                        if cnt >= 256:
+                        if cnt >= 128:
                             break
                     last_ack_time = now
                 elif in_flight >= UDP_WINDOW_SIZE:
                     # Окно полное — ждём ACK с коротким таймаутом
+                    if sys.platform == "win32":
+                        time.sleep(0.001)  # Небольшая пауза для Windows
                     r, _, _ = select.select([sock], [], [], 0.001)
                     if r:
                         continue  # перечитаем ACK на следующей итерации
@@ -238,7 +260,7 @@ class RUDPSocket:
         # ── FIN ──
         fin_seq = next_seq
         fin_pkt = self._pack(fin_seq, PacketType.FIN.value)
-        for _ in range(_FIN_RETRIES):
+        for attempt in range(_FIN_RETRIES):
             try:
                 self._send_raw(fin_pkt, addr)
             except ConnectionLostError:
@@ -248,7 +270,7 @@ class RUDPSocket:
                 continue
             try:
                 ap, _ = sock.recvfrom(16)
-            except OSError:
+            except (BlockingIOError, OSError):
                 continue
             if len(ap) >= _HDR_SIZE:
                 s, t = _HDR.unpack_from(ap)
@@ -277,31 +299,15 @@ class RUDPSocket:
                 print(f"\nConnection timeout ({_CONNECTION_TIMEOUT}s no data)")
                 break
 
-            # Ждём данные с коротким таймаутом
-            r, _, _ = select.select([sock], [], [], 0.005)
-
-            if not r:
-                # Периодический ACK чтобы sender не стоял
-                if now - last_ack_time > 0.002 and self.dest_addr:
-                    try:
-                        self._send_raw(
-                            _HDR.pack(expected, PacketType.ACK.value),
-                            self.dest_addr
-                        )
-                    except ConnectionLostError:
-                        break
-                    last_ack_time = now
-                continue
-
-            # ── Drain: читаем ВСЁ доступное за раз ──
-            batch = 0
-            while batch < 8192:
+            # Читаем все доступные пакеты
+            packets_read = 0
+            while packets_read < 1024:  # Ограничиваем количество за раз
                 try:
                     pkt, addr = sock.recvfrom(65536)
                 except (BlockingIOError, OSError):
                     break
 
-                batch += 1
+                packets_read += 1
 
                 if self.dest_addr is None:
                     self.dest_addr = addr
@@ -323,11 +329,12 @@ class RUDPSocket:
                         writer.write(bytes(write_buf))
                         write_buf.clear()
                     fin_ack = _HDR.pack(seq + 1, PacketType.ACK.value)
-                    for _ in range(5):
+                    for _ in range(10):  # Увеличено количество попыток
                         try:
                             self._send_raw(fin_ack, addr)
                         except ConnectionLostError:
                             pass
+                        time.sleep(0.01)
                     return total_received
 
                 if ptype != PacketType.DATA.value:
@@ -352,7 +359,7 @@ class RUDPSocket:
 
                 elif seq > expected and seq < expected + UDP_WINDOW_SIZE * 2:
                     # Out of order — буферизируем
-                    ooo.setdefault(seq, data)
+                    ooo[seq] = data
                     # NACK для пропущенного пакета
                     try:
                         self._send_raw(
@@ -373,7 +380,8 @@ class RUDPSocket:
             if progress_callback and pkts_since_ack > 0:
                 progress_callback(total_received)
 
-            if pkts_since_ack >= UDP_ACK_INTERVAL or time.monotonic() - last_ack_time > 0.002:
+            # Отправляем ACK
+            if pkts_since_ack >= UDP_ACK_INTERVAL or time.monotonic() - last_ack_time > 0.005:  # Увеличен интервал
                 if self.dest_addr:
                     try:
                         self._send_raw(
@@ -384,6 +392,10 @@ class RUDPSocket:
                         break
                 pkts_since_ack = 0
                 last_ack_time = time.monotonic()
+
+            # Небольшая пауза для Windows чтобы не перегружать CPU
+            if sys.platform == "win32" and packets_read == 0:
+                time.sleep(0.001)
 
         if write_buf:
             writer.write(bytes(write_buf))

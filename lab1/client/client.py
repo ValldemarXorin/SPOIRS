@@ -2,6 +2,7 @@
 
 import socket
 import time
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -11,6 +12,7 @@ from common.socket_utils import (
     recv_until,
     recv_exact,
     send_all,
+    create_udp_socket,
 )
 from common.rudp import RUDPSocket
 
@@ -26,13 +28,15 @@ class FileTransferClient:
         self.download_dir = Path("./downloads")
         self.download_dir.mkdir(exist_ok=True)
 
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Создаем UDP сокет с правильными параметрами для Windows
+        self.udp_socket = create_udp_socket()
         self.udp_socket.setblocking(False)
-        for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-            try:
-                self.udp_socket.setsockopt(socket.SOL_SOCKET, opt, 16 * 1024 * 1024)
-            except OSError:
-                pass
+
+        # Привязываем к случайному порту
+        try:
+            self.udp_socket.bind(("", 0))
+        except OSError as e:
+            print(f"UDP bind warning: {e}")
 
         self._prog_ts = 0.0
         self._prog_pct = -1
@@ -44,7 +48,7 @@ class FileTransferClient:
             self.tcp_socket = create_client_socket()
             self.tcp_socket.connect((self.host, self.port))
             self.connected = True
-            welcome = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
+            welcome = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=5)
             if welcome:
                 print(welcome.decode().strip())
             return True
@@ -79,7 +83,7 @@ class FileTransferClient:
             return None
         try:
             send_all(self.tcp_socket, (command + "\n").encode())
-            resp = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
+            resp = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
             return resp.decode().strip() if resp else None
         except socket.error as e:
             print(f"Command failed: {e}")
@@ -126,7 +130,7 @@ class FileTransferClient:
             if not self.connected:
                 return False
             send_all(self.tcp_socket, (cmd + "\n").encode())
-            raw = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
+            raw = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
             resp = raw.decode().strip() if raw else ""
             if not resp or not resp.startswith("READY"):
                 print(f"Not ready: {resp}")
@@ -149,6 +153,8 @@ class FileTransferClient:
                 sent = size
             except Exception as e:
                 print(f"\nUDP upload error: {e}")
+                import traceback
+                traceback.print_exc()
             self._stats("Upload", sent, time.time() - t0)
             return sent == size
 
@@ -203,7 +209,7 @@ class FileTransferClient:
             if not self.connected:
                 return False
             send_all(self.tcp_socket, (cmd + "\n").encode())
-            r = recv_until(self.tcp_socket, COMMAND_TERMINATOR)
+            r = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
             if not r:
                 print("No response")
                 return False
@@ -225,15 +231,47 @@ class FileTransferClient:
             fp = self.download_dir / filename
             mode = "ab" if offset else "wb"
             try:
-                rudp = RUDPSocket(self.udp_socket, dest_addr=None)
+                # Создаем новый сокет для скачивания
+                dl_sock = create_udp_socket()
+                dl_sock.setblocking(False)
+                dl_sock.bind(("", 0))
+
+                # Ждем порт от сервера
+                port_info = None
+                timeout = time.time() + 10
+                while time.time() < timeout:
+                    r, _, _ = select.select([self.udp_socket], [], [], 0.1)
+                    if r:
+                        try:
+                            data, addr = self.udp_socket.recvfrom(65536)
+                            msg = data.decode(errors="ignore")
+                            if "DOWNLOAD_PORT" in msg:
+                                port = int(msg.split()[1])
+                                port_info = (self.host, port)
+                                break
+                        except:
+                            pass
+
+                if not port_info:
+                    print("No download port from server")
+                    dl_sock.close()
+                    return False
+
+                # Отправляем hello
+                dl_sock.sendto(b"HELLO", port_info)
+
+                rudp = RUDPSocket(dl_sock, dest_addr=port_info)
                 with open(fp, mode) as f:
                     received = rudp.recv_stream(
                         f,
                         total_size=fsize,
                         progress_callback=lambda r: self._prog(r, fsize),
                     )
+                dl_sock.close()
             except Exception as e:
                 print(f"\nUDP download error: {e}")
+                import traceback
+                traceback.print_exc()
                 received = 0
         else:
             received = self._recv_tcp(filename, fsize, offset)
@@ -283,7 +321,7 @@ class FileTransferClient:
             return
         pct = int(cur / total * 100)
         now = time.time()
-        if cur == total or now - self._prog_ts >= 0.1 or pct != self._prog_pct:
+        if cur == total or now - self._prog_ts >= 0.2 or pct != self._prog_pct:
             print(f"\rProgress: {pct}% ({cur}/{total})", end="", flush=True)
             self._prog_ts = now
             self._prog_pct = pct
@@ -353,7 +391,10 @@ class InteractiveClient:
                 print("Usage: UPLOAD <path> [--udp]")
                 return True
             ok = self.client.upload_file(args, use_udp)
-            self.last_up = None if ok else (args, 0, use_udp)
+            if not ok:
+                self.last_up = (args, 0, use_udp)
+            else:
+                self.last_up = None
             return True
 
         if command == "DOWNLOAD":
@@ -361,7 +402,10 @@ class InteractiveClient:
                 print("Usage: DOWNLOAD <filename> [--udp]")
                 return True
             ok = self.client.download_file(args, use_udp)
-            self.last_down = None if ok else (args, 0, use_udp)
+            if not ok:
+                self.last_down = (args, 0, use_udp)
+            else:
+                self.last_down = None
             return True
 
         if command == "RESUME":
