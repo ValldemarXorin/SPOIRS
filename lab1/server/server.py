@@ -1,5 +1,7 @@
-"""TCP/UDP сервер — обработка upload через non-blocking select loop,
-download через блокирующий RUDP send_stream в том же потоке.
+"""TCP/UDP сервер.
+
+UDP upload: обработка DATA/ACK в select-цикле.
+UDP download: send_stream через выделенный сокет в отдельном потоке.
 
 Кроссплатформенный: Windows + Linux.
 """
@@ -16,8 +18,7 @@ from typing import Optional, Dict, Tuple
 
 from common.protocol import (
     CommandType, PacketType, parse_command, format_response,
-    COMMAND_TERMINATOR, UDP_PAYLOAD_SIZE, UDP_WINDOW_SIZE, UDP_TIMEOUT,
-    Response,
+    COMMAND_TERMINATOR, UDP_WINDOW_SIZE, Response,
 )
 from common.socket_utils import create_server_socket, send_all, create_udp_socket
 from common.rudp import RUDPSocket, ConnectionLostError
@@ -25,7 +26,7 @@ from server.command_handler import CommandHandler
 from server.file_manager import FileManager, TransferSession
 
 TCP_CHUNK = 64 * 1024
-UDP_READ_BATCH = 2048
+UDP_READ_BATCH = 4096
 _HDR = struct.Struct("!IB")
 
 
@@ -49,20 +50,13 @@ class TCPServer:
         self.outputs = []
         self.tcp_buffers: Dict[int, bytes] = {}
 
-        # Track active UDP download threads
-        self._udp_download_threads: Dict[str, threading.Thread] = {}
-
-    # ── lifecycle ──────────────────────────────────────────
-
     def start(self) -> None:
         self._setup_signals()
 
-        # TCP
         self.server_socket_tcp = create_server_socket(self.host, self.port)
         self.server_socket_tcp.setblocking(False)
         self.inputs.append(self.server_socket_tcp)
 
-        # UDP
         self.server_socket_udp = create_udp_socket()
         self.server_socket_udp.bind((self.host, self.port))
         self.server_socket_udp.setblocking(False)
@@ -95,20 +89,17 @@ class TCPServer:
             except OSError:
                 pass
 
-    # ── main loop ─────────────────────────────────────────
-
     def _loop(self) -> None:
         while self.running:
             try:
                 self.outputs = [
-                    s.sock
-                    for s in self.file_manager.sessions.values()
+                    s.sock for s in self.file_manager.sessions.values()
                     if (not s.is_upload and s.sock is not None
                         and s.sock in self.inputs)
                 ]
 
                 readable, writable, exceptional = select.select(
-                    self.inputs, self.outputs, self.inputs, 0.01
+                    self.inputs, self.outputs, self.inputs, 0.005
                 )
 
                 for s in readable:
@@ -125,22 +116,19 @@ class TCPServer:
                 for s in exceptional:
                     self._remove(s)
 
-                # Process pending UDP upload ACKs
-                self._udp_process_uploads()
+                self._udp_send_acks()
 
             except Exception as e:
                 if self.running:
                     print(f"[{_ts()}] Loop error: {e}")
-                continue
 
-    # ── TCP handlers ──────────────────────────────────────
+    # ── TCP ───────────────────────────────────────────────
 
     def _tcp_accept(self) -> None:
         try:
             client_sock, addr = self.server_socket_tcp.accept()
         except OSError:
             return
-
         print(f"[{_ts()}] TCP Connect: {addr[0]}:{addr[1]}")
         client_sock.setblocking(False)
         self.inputs.append(client_sock)
@@ -151,25 +139,20 @@ class TCPServer:
         cid = str(sock.fileno())
         session = self.file_manager.get_session(cid)
 
-        # TCP upload data
         if session and session.is_upload:
             try:
                 chunk = sock.recv(TCP_CHUNK)
             except OSError:
                 self._remove(sock)
                 return
-
             if not chunk:
                 self._remove(sock)
                 return
-
             try:
                 session.file_handle.write(chunk)
-            except (IOError, OSError) as e:
-                print(f"[{_ts()}] Write error: {e}")
+            except (IOError, OSError):
                 self._remove(sock)
                 return
-
             session.transferred += len(chunk)
             session.last_activity = time.time()
             self._log(cid, session, "TCP Upload")
@@ -178,18 +161,17 @@ class TCPServer:
                 bitrate = self.file_manager.calculate_bitrate(session)
                 br_str = self.file_manager.format_bitrate(bitrate)
                 self.file_manager.complete_session(cid)
-                msg = f"Received {session.transferred} bytes. {br_str}"
-                send_all(sock, format_response(Response(True, msg)))
+                send_all(sock, format_response(
+                    Response(True, f"Received {session.transferred} bytes. {br_str}")
+                ))
                 print(f"[{_ts()}] TCP Upload done ({br_str})")
             return
 
-        # Command channel
         try:
             data = sock.recv(4096)
         except OSError:
             self._remove(sock)
             return
-
         if not data:
             self._remove(sock)
             return
@@ -204,10 +186,8 @@ class TCPServer:
             print(f"[{_ts()}] TCP CMD [{cid}]: {raw.strip()}")
 
             resp = self.command_handler.execute(cmd, sock, None, None)
-            transfer_cmds = {
-                CommandType.UPLOAD, CommandType.DOWNLOAD,
-                CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD,
-            }
+            transfer_cmds = {CommandType.UPLOAD, CommandType.DOWNLOAD,
+                             CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD}
             if cmd.type not in transfer_cmds or not resp.success:
                 send_all(sock, format_response(resp))
 
@@ -229,7 +209,6 @@ class TCPServer:
             try:
                 sent = sock.send(chunk)
                 if sent < len(chunk):
-                    # Seek back for unsent data
                     session.file_handle.seek(-(len(chunk) - sent), 1)
                 session.transferred += sent
             except OSError:
@@ -243,10 +222,9 @@ class TCPServer:
             self.file_manager.complete_session(cid)
             print(f"[{_ts()}] TCP Download done ({br_str})")
 
-    # ── UDP handlers ──────────────────────────────────────
+    # ── UDP ───────────────────────────────────────────────
 
     def _udp_read(self) -> None:
-        """Read all available UDP packets and dispatch."""
         if not self.server_socket_udp:
             return
 
@@ -256,37 +234,22 @@ class TCPServer:
             except (BlockingIOError, OSError):
                 break
 
-            if len(pkt) < 5:  # UDP_HEADER_SIZE
+            if len(pkt) < 5:
                 continue
 
             seq, ptype = _HDR.unpack_from(pkt)
             data = pkt[5:]
             cid = f"{addr[0]}:{addr[1]}"
 
-            # ── Command packet ──
             if ptype == PacketType.CMD.value:
                 self._udp_handle_cmd(cid, seq, data, addr)
-                continue
-
-            # ── DATA packet (upload from client) ──
-            if ptype == PacketType.DATA.value:
+            elif ptype == PacketType.DATA.value:
                 self._udp_handle_data(cid, seq, data, addr)
-                continue
-
-            # ── FIN packet (upload from client) ──
-            if ptype == PacketType.FIN.value:
+            elif ptype == PacketType.FIN.value:
                 self._udp_handle_fin(cid, seq, addr)
-                continue
-
-            # ── ACK packet (response to our download send) ──
-            if ptype == PacketType.ACK.value:
-                # Handled by download thread's recv_stream ACK processing
-                pass
 
     def _udp_handle_cmd(self, cid: str, seq: int, data: bytes,
                         addr: Tuple[str, int]) -> None:
-        """Handle a UDP command packet."""
-        # Send command ACK immediately
         ack_pkt = _HDR.pack(seq, PacketType.CMD.value) + b"ACK_CMD"
         try:
             self.server_socket_udp.sendto(ack_pkt, addr)
@@ -294,9 +257,7 @@ class TCPServer:
             pass
 
         msg = data.decode(errors="ignore")
-
-        # Skip if it's a response (not a command)
-        if msg.startswith("OK") or msg.startswith("ERROR"):
+        if msg.startswith("OK") or msg.startswith("ERROR") or msg == "ACK_CMD":
             return
 
         cmd = parse_command(msg, "UDP")
@@ -306,27 +267,20 @@ class TCPServer:
             cmd, None, self.server_socket_udp, addr
         )
 
-        transfer_cmds = {
-            CommandType.UPLOAD, CommandType.DOWNLOAD,
-            CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD,
-        }
+        transfer_cmds = {CommandType.UPLOAD, CommandType.DOWNLOAD,
+                         CommandType.RESUME_UPLOAD, CommandType.RESUME_DOWNLOAD}
 
         if cmd.type in transfer_cmds:
             if not resp.success:
-                err_pkt = (_HDR.pack(0, PacketType.CMD.value) +
-                           format_response(resp))
+                err_pkt = _HDR.pack(0, PacketType.CMD.value) + format_response(resp)
                 try:
                     self.server_socket_udp.sendto(err_pkt, addr)
                 except OSError:
                     pass
-            elif cmd.type in (CommandType.DOWNLOAD,
-                              CommandType.RESUME_DOWNLOAD):
-                # Start download in a separate thread using dedicated socket
+            elif cmd.type in (CommandType.DOWNLOAD, CommandType.RESUME_DOWNLOAD):
                 self._start_udp_download(cid, addr)
         else:
-            # Non-transfer command — send response
-            resp_pkt = (_HDR.pack(0, PacketType.CMD.value) +
-                        format_response(resp))
+            resp_pkt = _HDR.pack(0, PacketType.CMD.value) + format_response(resp)
             try:
                 self.server_socket_udp.sendto(resp_pkt, addr)
             except OSError:
@@ -334,7 +288,6 @@ class TCPServer:
 
     def _udp_handle_data(self, cid: str, seq: int, data: bytes,
                          addr: Tuple[str, int]) -> None:
-        """Handle incoming DATA packet for UDP upload."""
         session = self.file_manager.get_session(cid)
         if not session or not session.is_upload:
             return
@@ -349,7 +302,6 @@ class TCPServer:
             session.transferred += len(data)
             session.expected_seq += 1
 
-            # Drain out-of-order buffer
             while session.expected_seq in session.udp_recv_buffer:
                 d = session.udp_recv_buffer.pop(session.expected_seq)
                 try:
@@ -362,11 +314,8 @@ class TCPServer:
             self._log(cid, session, "UDP Upload")
 
         elif seq > session.expected_seq:
-            max_buf = UDP_WINDOW_SIZE * 4
-            if seq < session.expected_seq + max_buf:
+            if seq < session.expected_seq + UDP_WINDOW_SIZE * 4:
                 session.udp_recv_buffer.setdefault(seq, data)
-
-            # Send NACK for missing packet
             nack = _HDR.pack(session.expected_seq, PacketType.NACK.value)
             try:
                 self.server_socket_udp.sendto(nack, addr)
@@ -375,10 +324,6 @@ class TCPServer:
 
     def _udp_handle_fin(self, cid: str, seq: int,
                         addr: Tuple[str, int]) -> None:
-        """Handle FIN packet — finalize upload."""
-        session = self.file_manager.get_session(cid)
-
-        # Send FIN-ACK
         fin_ack = _HDR.pack(seq + 1, PacketType.ACK.value)
         for _ in range(5):
             try:
@@ -386,75 +331,103 @@ class TCPServer:
             except OSError:
                 pass
 
+        session = self.file_manager.get_session(cid)
         if session and session.is_upload:
             bitrate = self.file_manager.calculate_bitrate(session)
             br_str = self.file_manager.format_bitrate(bitrate)
             self.file_manager.complete_session(cid)
             print(f"[{_ts()}] UDP Upload done: {session.filename} ({br_str})")
 
-    def _udp_process_uploads(self) -> None:
-        """Send periodic ACKs for active UDP upload sessions."""
+    def _udp_send_acks(self) -> None:
+        """Частые ACK для UDP upload — ключ к скорости sender'а."""
         now = time.time()
         for cid, session in list(self.file_manager.sessions.items()):
             if not session.is_upload:
                 continue
-            # Identify UDP sessions by cid format "ip:port"
             if ":" not in cid or cid.isdigit():
                 continue
+            if now - session.udp_last_ack_time < 0.002:
+                continue
 
-            # Send ACK periodically
-            if now - session.udp_last_ack_time > 0.005:
-                parts = cid.rsplit(":", 1)
-                if len(parts) != 2:
-                    continue
-                try:
-                    addr = (parts[0], int(parts[1]))
-                except ValueError:
-                    continue
+            parts = cid.rsplit(":", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                addr = (parts[0], int(parts[1]))
+            except ValueError:
+                continue
 
-                ack = _HDR.pack(session.expected_seq, PacketType.ACK.value)
-                try:
-                    self.server_socket_udp.sendto(ack, addr)
-                except OSError:
-                    pass
-                session.udp_last_ack_time = now
+            ack = _HDR.pack(session.expected_seq, PacketType.ACK.value)
+            try:
+                self.server_socket_udp.sendto(ack, addr)
+            except OSError:
+                pass
+            session.udp_last_ack_time = now
 
     def _start_udp_download(self, cid: str, addr: Tuple[str, int]) -> None:
-        """Start UDP download in a separate thread with dedicated socket."""
+        """UDP download через выделенный сокет в отдельном потоке."""
         session = self.file_manager.get_session(cid)
         if not session or session.is_upload:
             return
 
+        session.udp_download_active = True
+        session.udp_client_addr = addr
+        file_handle = session.file_handle
+        total_size = session.total_size
+        filename = session.filename
+
         def download_worker():
-            # Create dedicated UDP socket for this download
             dl_sock = create_udp_socket()
             dl_sock.setblocking(False)
-            # Bind to ephemeral port
             dl_sock.bind(('', 0))
-            local_port = dl_sock.getsockname()[1]
+            dl_port = dl_sock.getsockname()[1]
 
-            # Notify client of the download port via command
-            notify = (_HDR.pack(0, PacketType.CMD.value) +
-                      f"DOWNLOAD_PORT {local_port}\n".encode())
-            try:
-                self.server_socket_udp.sendto(notify, addr)
-            except OSError:
+            print(f"[{_ts()}] UDP Download: {filename} → "
+                  f"{addr[0]}:{addr[1]} via port {dl_port}")
+
+            # Отправляем клиенту порт (надёжно, несколько раз)
+            port_pkt = (_HDR.pack(0, PacketType.CMD.value) +
+                        f"DOWNLOAD_PORT {dl_port}".encode())
+            for i in range(10):
+                try:
+                    self.server_socket_udp.sendto(port_pkt, addr)
+                except OSError:
+                    pass
+                time.sleep(0.03)
+
+            # Ждём hello от клиента
+            client_dl_addr = None
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 10.0:
+                r, _, _ = select.select([dl_sock], [], [], 0.1)
+                if r:
+                    try:
+                        _, ca = dl_sock.recvfrom(65536)
+                        client_dl_addr = ca
+                        break
+                    except OSError:
+                        continue
+
+            if client_dl_addr is None:
+                print(f"[{_ts()}] UDP Download: no hello from client")
+                self.file_manager.close_session(cid)
                 dl_sock.close()
                 return
 
-            # Wait briefly for client to be ready
-            time.sleep(0.1)
+            print(f"[{_ts()}] UDP Download: client at "
+                  f"{client_dl_addr[0]}:{client_dl_addr[1]}, starting stream")
 
             try:
-                rudp = RUDPSocket(dl_sock, dest_addr=addr)
+                rudp = RUDPSocket(dl_sock, dest_addr=client_dl_addr)
                 rudp.send_stream(
-                    session.file_handle,
-                    total_size=session.total_size,
-                    progress_callback=lambda s: self._update_session(cid, s),
+                    file_handle,
+                    total_size=total_size,
+                    progress_callback=lambda s: self._update_dl(cid, s, session),
                 )
+                session.transferred = total_size
                 bitrate = self.file_manager.calculate_bitrate(session)
                 br_str = self.file_manager.format_bitrate(bitrate)
-                print(f"[{_ts()}] UDP Download done: {session.filename} ({br_str})")
+                print(f"[{_ts()}] UDP Download done: {filename} ({br_str})")
             except ConnectionLostError as e:
                 print(f"[{_ts()}] UDP Download failed: {e}")
             except Exception as e:
@@ -465,13 +438,12 @@ class TCPServer:
 
         t = threading.Thread(target=download_worker, daemon=True)
         t.start()
-        self._udp_download_threads[cid] = t
 
-    def _update_session(self, cid: str, transferred: int) -> None:
-        session = self.file_manager.get_session(cid)
-        if session:
-            session.transferred = transferred
-            session.last_activity = time.time()
+    def _update_dl(self, cid: str, transferred: int,
+                   session: TransferSession) -> None:
+        session.transferred = transferred
+        session.last_activity = time.time()
+        self._log(cid, session, "UDP Download")
 
     # ── utils ─────────────────────────────────────────────
 

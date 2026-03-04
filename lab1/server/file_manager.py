@@ -8,7 +8,6 @@ from pathlib import Path
 
 @dataclass
 class TransferSession:
-    """Сессия передачи файла."""
     filename: str
     total_size: int
     transferred: int
@@ -19,33 +18,18 @@ class TransferSession:
     file_handle: Optional[Any] = None
     sock: Optional[Any] = None
 
-    # UDP upload (server receive)
     expected_seq: int = 0
     udp_recv_buffer: Dict[int, bytes] = field(default_factory=dict)
 
-    # UDP download (server send)
-    next_seq_num: int = 0
-    window_base: int = 0
-    udp_packets: Dict[int, bytes] = field(default_factory=dict)
-    udp_eof: bool = False
-    udp_last_ack_time: float = 0.0
-
-    # FIN state
-    udp_fin_sent: bool = False
-    udp_fin_seq: int = 0
-    udp_fin_acked: bool = False
-    udp_last_fin_time: float = 0.0
-    udp_fin_tries: int = 0
+    udp_download_active: bool = False
+    udp_client_addr: Optional[Any] = None
 
     last_activity: float = 0.0
-
-    # logging helper
+    udp_last_ack_time: float = 0.0
     _last_pct: int = -10
 
 
 class FileManager:
-    """Менеджер хранения файлов и сессий."""
-
     def __init__(self, storage_dir: str = "./server_files"):
         self.storage_dir = Path(storage_dir)
         self.temp_dir = self.storage_dir / ".temp"
@@ -60,8 +44,7 @@ class FileManager:
         return client_addr.replace(":", "_").replace("/", "_")
 
     def get_file_path(self, filename: str) -> Path:
-        safe_name = Path(filename).name
-        return self.storage_dir / safe_name
+        return self.storage_dir / Path(filename).name
 
     def get_temp_path(self, filename: str, client_addr: str) -> Path:
         safe_name = Path(filename).name
@@ -78,29 +61,21 @@ class FileManager:
     def create_session(self, filename: str, total_size: int,
                        client_id: str, is_upload: bool,
                        sock=None) -> Optional[TransferSession]:
-        """Создаёт сессию передачи файла."""
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
 
         now = time.time()
         session = TransferSession(
-            filename=filename,
-            total_size=total_size,
-            transferred=0,
-            start_time=now,
-            client_id=client_id,
-            is_upload=is_upload,
-            temp_path=temp_path,
-            sock=sock,
-            last_activity=now,
-            udp_last_ack_time=now,
+            filename=filename, total_size=total_size,
+            transferred=0, start_time=now, client_id=client_id,
+            is_upload=is_upload, temp_path=temp_path, sock=sock,
+            last_activity=now, udp_last_ack_time=now,
         )
 
         try:
             if is_upload:
                 session.file_handle = open(temp_path, 'wb')
             else:
-                path = self.get_file_path(filename)
-                session.file_handle = open(path, 'rb')
+                session.file_handle = open(self.get_file_path(filename), 'rb')
         except IOError as e:
             print(f"Error opening file for session: {e}")
             return None
@@ -112,7 +87,6 @@ class FileManager:
         return self.sessions.get(client_id)
 
     def close_session(self, client_id: str) -> None:
-        """Закрывает сессию без перемещения файла."""
         session = self.sessions.get(client_id)
         if session and session.file_handle:
             try:
@@ -122,11 +96,9 @@ class FileManager:
         self.sessions.pop(client_id, None)
 
     def complete_session(self, client_id: str) -> None:
-        """Завершает сессию: закрывает файл и перемещает из temp в storage."""
         session = self.sessions.get(client_id)
         if not session:
             return
-
         if session.file_handle:
             try:
                 session.file_handle.close()
@@ -146,9 +118,7 @@ class FileManager:
 
     def calculate_bitrate(self, session: TransferSession) -> float:
         elapsed = time.time() - session.start_time
-        if elapsed <= 0:
-            return 0.0
-        return session.transferred / elapsed
+        return session.transferred / elapsed if elapsed > 0 else 0.0
 
     def format_bitrate(self, bitrate: float) -> str:
         if bitrate >= 1024 * 1024:

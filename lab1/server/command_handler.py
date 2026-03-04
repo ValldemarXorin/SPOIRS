@@ -2,16 +2,12 @@
 
 import struct
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 from common.protocol import (
     Command, CommandType, Response, PacketType, format_response
 )
 from common.socket_utils import send_all
 from server.file_manager import FileManager
-
-if TYPE_CHECKING:
-    import socket
 
 _HDR = struct.Struct("!IB")
 
@@ -47,35 +43,26 @@ class CommandHandler:
             size = int(cmd.args[1])
         except ValueError:
             return Response(False, "Invalid size")
-        return self._init_upload(
-            cmd.protocol, tcp_sock, udp_sock, udp_addr,
-            cmd.args[0], size, 0
-        )
+        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr,
+                                 cmd.args[0], size, 0)
 
     def _resume_upload(self, cmd, tcp_sock, udp_sock, udp_addr):
         if len(cmd.args) < 3:
             return Response(False, "Usage: RESUME_UPLOAD <f> <off> <size>")
         try:
-            offset = int(cmd.args[1])
-            size = int(cmd.args[2])
+            offset, size = int(cmd.args[1]), int(cmd.args[2])
         except ValueError:
             return Response(False, "Invalid args")
-        return self._init_upload(
-            cmd.protocol, tcp_sock, udp_sock, udp_addr,
-            cmd.args[0], size, offset
-        )
+        return self._init_upload(cmd.protocol, tcp_sock, udp_sock, udp_addr,
+                                 cmd.args[0], size, offset)
 
     def _init_upload(self, proto, tcp_sock, udp_sock, udp_addr,
                      filename, size, offset):
-        if proto == "UDP":
-            cid = f"{udp_addr[0]}:{udp_addr[1]}"
-        else:
-            cid = str(tcp_sock.fileno())
-
+        cid = (f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP"
+               else str(tcp_sock.fileno()))
         self.fm.close_session(cid)
-        sess = self.fm.create_session(
-            filename, size, cid, is_upload=True, sock=tcp_sock
-        )
+        sess = self.fm.create_session(filename, size, cid, is_upload=True,
+                                      sock=tcp_sock)
         if not sess:
             return Response(False, "Cannot create session")
 
@@ -97,10 +84,8 @@ class CommandHandler:
     def _download(self, cmd, tcp_sock, udp_sock, udp_addr):
         if not cmd.args:
             return Response(False, "Usage: DOWNLOAD <filename>")
-        return self._init_download(
-            cmd.protocol, tcp_sock, udp_sock, udp_addr,
-            cmd.args[0], 0
-        )
+        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr,
+                                   cmd.args[0], 0)
 
     def _resume_download(self, cmd, tcp_sock, udp_sock, udp_addr):
         if len(cmd.args) < 2:
@@ -109,10 +94,8 @@ class CommandHandler:
             offset = int(cmd.args[1])
         except ValueError:
             return Response(False, "Invalid offset")
-        return self._init_download(
-            cmd.protocol, tcp_sock, udp_sock, udp_addr,
-            cmd.args[0], offset
-        )
+        return self._init_download(cmd.protocol, tcp_sock, udp_sock, udp_addr,
+                                   cmd.args[0], offset)
 
     def _init_download(self, proto, tcp_sock, udp_sock, udp_addr,
                        filename, offset):
@@ -122,20 +105,19 @@ class CommandHandler:
         fsize = self.fm.get_file_size(filename)
         remaining = fsize - offset
 
-        if proto == "UDP":
-            cid = f"{udp_addr[0]}:{udp_addr[1]}"
-        else:
-            cid = str(tcp_sock.fileno())
-
+        cid = (f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP"
+               else str(tcp_sock.fileno()))
         self.fm.close_session(cid)
-        sess = self.fm.create_session(
-            filename, remaining, cid, is_upload=False, sock=tcp_sock
-        )
+        sess = self.fm.create_session(filename, remaining, cid,
+                                      is_upload=False, sock=tcp_sock)
         if not sess:
             return Response(False, "Cannot open file")
 
         if offset > 0 and sess.file_handle:
             sess.file_handle.seek(offset)
+
+        if proto == "UDP":
+            sess.udp_client_addr = udp_addr
 
         info = f"FILE {remaining}"
         if proto == "UDP":

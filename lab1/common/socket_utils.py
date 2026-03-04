@@ -7,7 +7,6 @@ from typing import Optional
 
 
 def create_server_socket(host: str, port: int) -> socket.socket:
-    """Создаёт серверный TCP сокет."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     _configure_keepalive(sock)
@@ -17,16 +16,13 @@ def create_server_socket(host: str, port: int) -> socket.socket:
 
 
 def create_client_socket() -> socket.socket:
-    """Создаёт клиентский TCP сокет."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     _configure_keepalive(sock)
     return sock
 
 
 def _configure_keepalive(sock: socket.socket) -> None:
-    """Включает SO_KEEPALIVE — кроссплатформенно."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
     if sys.platform == "linux":
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
@@ -39,23 +35,25 @@ def _configure_keepalive(sock: socket.socket) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30)
         except (AttributeError, OSError):
             pass
-    # Windows: keepalive defaults are fine, or use SIO_KEEPALIVE_VALS via ioctl
 
 
-def create_udp_socket(buf_size: int = 16 * 1024 * 1024) -> socket.socket:
-    """Создаёт UDP сокет с увеличенными буферами."""
+def create_udp_socket(buf_size: int = 32 * 1024 * 1024) -> socket.socket:
+    """Создаёт UDP сокет с максимально увеличенными буферами."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Пробуем установить большой буфер, уменьшая если OS не даёт
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, opt, buf_size)
-        except OSError:
-            pass
+        target = buf_size
+        while target >= 1024 * 1024:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, opt, target)
+                break
+            except OSError:
+                target //= 2
     return sock
 
 
 def recv_until(sock: socket.socket, terminator: bytes,
                timeout: float = None) -> Optional[bytes]:
-    """Принимает данные до встречи terminator по TCP."""
     buffer = b""
     sock.settimeout(timeout)
     try:
@@ -73,7 +71,6 @@ def recv_until(sock: socket.socket, terminator: bytes,
 
 def recv_exact(sock: socket.socket, size: int,
                timeout: float = None) -> Optional[bytes]:
-    """Принимает ровно size байт."""
     buffer = b""
     sock.settimeout(timeout)
     try:
@@ -91,7 +88,6 @@ def recv_exact(sock: socket.socket, size: int,
 
 
 def send_all(sock: socket.socket, data: bytes) -> bool:
-    """Отправляет все данные, гарантируя полную отправку."""
     try:
         sock.sendall(data)
         return True
@@ -100,13 +96,11 @@ def send_all(sock: socket.socket, data: bytes) -> bool:
 
 
 def is_socket_ready(sock: socket.socket, timeout: float = 0) -> bool:
-    """Проверяет, готов ли сокет для чтения."""
     ready, _, _ = select.select([sock], [], [], timeout)
     return len(ready) > 0
 
 
 def get_peer_info(sock: socket.socket) -> str:
-    """Возвращает строковое представление адреса пира."""
     try:
         addr = sock.getpeername()
         return f"{addr[0]}:{addr[1]}"

@@ -21,7 +21,7 @@ class PacketType(Enum):
     ACK = 1
     FIN = 2
     CMD = 3
-    NACK = 4  # Selective NACK for fast retransmit
+    NACK = 4
 
 
 @dataclass
@@ -44,21 +44,22 @@ BUFFER_SIZE = 1024 * 1024
 ENCODING = "utf-8"
 
 # ── UDP ─────────────────────────────────────────────────
-# Оптимальный размер пакета:
-# - MTU Ethernet = 1500, IP header = 20, UDP header = 8 → max payload = 1472
-# - Но в локальной сети jumbo frames до 9000 байт
-# - Для максимальной скорости без фрагментации на стандартном Ethernet: 1472
-# - Для LAN с jumbo frames: 8192
-# - Мы используем 8192 (jumbo) для максимальной пропускной способности в LAN
-#   Если сеть не поддерживает jumbo — уменьшить до 1472
-UDP_PACKET_SIZE = 8192
-UDP_HEADER_SIZE = 5          # 4 bytes seq + 1 byte type
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 8187
-UDP_WINDOW_SIZE = 4096       # 4096 × 8KB ≈ 32 MB in flight
-UDP_TIMEOUT = 0.15           # retransmit timeout (seconds)
+# Размер пакета: 65507 - максимум для UDP, но фрагментация IP плоха.
+# Для localhost/LAN без фрагментации:
+#   - Стандартный Ethernet MTU=1500 → payload 1472 (без фрагментации)
+#   - Jumbo frame MTU=9000 → payload ~8960
+#   - Localhost: MTU=65535, фрагментация в kernel быстрая
+# Для максимальной скорости на localhost используем крупные пакеты,
+# kernel сам разберёт фрагментацию эффективнее чем мы по 1472.
+UDP_PACKET_SIZE = 32768          # 32KB payload+header
+UDP_HEADER_SIZE = 5              # 4 bytes seq + 1 byte type
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 32763
+
+UDP_WINDOW_SIZE = 2048           # пакетов в скользящем окне (≈64MB in flight)
+UDP_TIMEOUT = 0.05               # retransmit timeout — агрессивный
 UDP_RETRY_LIMIT = 40
-UDP_ACK_INTERVAL = 128       # ACK every N packets
-UDP_BURST_SIZE = 2048        # packets per send burst
+UDP_ACK_INTERVAL = 64            # ACK каждые N пакетов
+UDP_BURST_SIZE = 256             # пакетов за одну итерацию send
 
 
 def parse_command(raw_line: str, default_proto: str = "TCP") -> Command:

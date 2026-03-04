@@ -1,7 +1,4 @@
-"""TCP/UDP клиент с RUDP upload/download.
-
-Кроссплатформенный: Windows + Linux.
-"""
+"""TCP/UDP клиент. Кроссплатформенный: Windows + Linux."""
 
 import socket
 import time
@@ -26,7 +23,6 @@ class FileTransferClient:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-
         self.tcp_socket: Optional[socket.socket] = None
         self.connected = False
 
@@ -38,8 +34,6 @@ class FileTransferClient:
 
         self._prog_ts = 0.0
         self._prog_pct = -1
-
-    # ── connect / disconnect ──────────────────────────────
 
     def connect(self) -> bool:
         try:
@@ -70,13 +64,10 @@ class FileTransferClient:
         except OSError:
             pass
 
-    # ── commands ──────────────────────────────────────────
-
     def send_command(self, command: str, proto: str = "TCP") -> Optional[str]:
         if proto == "UDP":
             rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
             return rudp.send_command(command)
-
         if not self.connected:
             return None
         try:
@@ -109,12 +100,9 @@ class FileTransferClient:
     def _do_upload(self, path: Path, filename: str, size: int,
                    offset: int, use_udp: bool) -> bool:
         flag = "--udp" if use_udp else "--tcp"
-        if offset:
-            cmd = f"RESUME_UPLOAD {filename} {offset} {size} {flag}"
-        else:
-            cmd = f"UPLOAD {filename} {size} {flag}"
+        cmd = (f"RESUME_UPLOAD {filename} {offset} {size} {flag}" if offset
+               else f"UPLOAD {filename} {size} {flag}")
 
-        # Send command and get READY response
         if use_udp:
             rudp_cmd = RUDPSocket(self.udp_socket, (self.host, self.port))
             resp = rudp_cmd.send_command(cmd)
@@ -133,6 +121,7 @@ class FileTransferClient:
 
         proto_name = "UDP" if use_udp else "TCP"
         print(f"Uploading {filename} ({size} bytes) via {proto_name}...")
+        self._prog_pct = -1
         t0 = time.time()
 
         if use_udp:
@@ -141,13 +130,11 @@ class FileTransferClient:
                 rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
                 with open(path, "rb") as f:
                     f.seek(offset)
-                    rudp.send_stream(
-                        f, total_size=size,
-                        progress_callback=lambda s: self._prog(s, size),
-                    )
+                    rudp.send_stream(f, total_size=size,
+                                     progress_callback=lambda s: self._prog(s, size))
                 sent = size
             except ConnectionLostError as e:
-                print(f"\nUDP upload error (connection lost): {e}")
+                print(f"\nUDP upload error: {e}")
             except Exception as e:
                 print(f"\nUDP upload error: {e}")
             self._stats("Upload", sent, time.time() - t0)
@@ -191,11 +178,8 @@ class FileTransferClient:
                      use_udp: bool) -> bool:
         filename = Path(filename).name
         flag = "--udp" if use_udp else "--tcp"
-
-        if offset:
-            cmd = f"RESUME_DOWNLOAD {filename} {offset} {flag}"
-        else:
-            cmd = f"DOWNLOAD {filename} {flag}"
+        cmd = (f"RESUME_DOWNLOAD {filename} {offset} {flag}" if offset
+               else f"DOWNLOAD {filename} {flag}")
 
         if use_udp:
             resp_str = RUDPSocket(
@@ -225,6 +209,7 @@ class FileTransferClient:
 
         proto_name = "UDP" if use_udp else "TCP"
         print(f"Downloading {filename} ({fsize} bytes) via {proto_name}...")
+        self._prog_pct = -1
         t0 = time.time()
 
         if use_udp:
@@ -240,14 +225,12 @@ class FileTransferClient:
 
     def _recv_udp_download(self, filename: str, fsize: int,
                            offset: int) -> int:
-        """Receive a file via UDP download.
+        """Принимает файл по UDP через выделенный сокет."""
 
-        Server sends DOWNLOAD_PORT notification, then streams from that port.
-        """
-        # Wait for DOWNLOAD_PORT notification from server
+        # Ждём DOWNLOAD_PORT от сервера
         download_port = None
         t0 = time.monotonic()
-        while time.monotonic() - t0 < 5.0:
+        while time.monotonic() - t0 < 15.0:
             r, _, _ = select.select([self.udp_socket], [], [], 0.1)
             if not r:
                 continue
@@ -257,40 +240,45 @@ class FileTransferClient:
                 continue
             if len(pkt) < UDP_HEADER_SIZE:
                 continue
-            seq, ptype = _HDR.unpack_from(pkt)
+            _, ptype = _HDR.unpack_from(pkt)
             if ptype == PacketType.CMD.value:
                 msg = pkt[UDP_HEADER_SIZE:].decode(errors="ignore")
-                if msg.startswith("DOWNLOAD_PORT"):
-                    parts = msg.split()
-                    if len(parts) >= 2:
+                if "DOWNLOAD_PORT" in msg:
+                    for part in msg.split():
                         try:
-                            download_port = int(parts[1])
+                            download_port = int(part)
+                            break
                         except ValueError:
-                            pass
-                    break
+                            continue
+                    if download_port:
+                        break
 
         if download_port is None:
-            print("\nNo download port received from server")
+            print("\nTimeout waiting for download port")
             return 0
 
-        # Create dedicated socket for receiving from server's download port
+        print(f"  Server download port: {download_port}")
+
+        # Выделенный сокет для приёма
         dl_sock = create_udp_socket()
         dl_sock.setblocking(False)
         dl_sock.bind(('', 0))
 
-        # Send a "hello" packet so server knows our address
         server_dl_addr = (self.host, download_port)
+
+        # Hello (несколько раз для надёжности)
         hello = _HDR.pack(0, PacketType.ACK.value)
-        for _ in range(3):
+        for _ in range(10):
             try:
                 dl_sock.sendto(hello, server_dl_addr)
             except OSError:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.03)
 
         fp = self.download_dir / filename
         mode = "ab" if offset else "wb"
         received = 0
+
         try:
             rudp = RUDPSocket(dl_sock, dest_addr=server_dl_addr)
             with open(fp, mode) as f:
@@ -299,7 +287,7 @@ class FileTransferClient:
                     progress_callback=lambda r: self._prog(r, fsize),
                 )
         except ConnectionLostError as e:
-            print(f"\nUDP download error (connection lost): {e}")
+            print(f"\nUDP download error: {e}")
         except Exception as e:
             print(f"\nUDP download error: {e}")
         finally:
@@ -417,24 +405,16 @@ class InteractiveClient:
             if not args:
                 print("Usage: UPLOAD <path> [--udp]")
                 return True
-            filepath = args[0]
-            ok = self.client.upload_file(filepath, use_udp)
-            if not ok:
-                self.last_up = (filepath, 0, use_udp)
-            else:
-                self.last_up = None
+            ok = self.client.upload_file(args[0], use_udp)
+            self.last_up = None if ok else (args[0], 0, use_udp)
             return True
 
         if command == "DOWNLOAD":
             if not args:
                 print("Usage: DOWNLOAD <filename> [--udp]")
                 return True
-            fname = args[0]
-            ok = self.client.download_file(fname, use_udp)
-            if not ok:
-                self.last_down = (fname, 0, use_udp)
-            else:
-                self.last_down = None
+            ok = self.client.download_file(args[0], use_udp)
+            self.last_down = None if ok else (args[0], 0, use_udp)
             return True
 
         if command == "RESUME_UPLOAD":
@@ -470,7 +450,6 @@ class InteractiveClient:
                 print("Nothing to resume")
             return True
 
-        # Generic command (ECHO, TIME, etc.)
         resp = self.client.send_command(cmd, "UDP" if use_udp else "TCP")
         if resp:
             print(resp)
