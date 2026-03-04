@@ -55,7 +55,14 @@ class CommandHandler:
                                  cmd.args[0], size, offset)
 
     def _init_upload(self, proto, tcp_sock, udp_sock, udp_addr, filename, size, offset):
-        cid = f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP" else str(tcp_sock.fileno())
+        # Безопасное создание client_id для UDP
+        if proto == "UDP" and udp_addr is not None:
+            cid = f"{udp_addr[0]}:{udp_addr[1]}"
+        elif proto == "UDP":
+            cid = f"udp_unknown_{time.time()}"
+        else:
+            cid = str(tcp_sock.fileno()) if tcp_sock else f"tcp_unknown_{time.time()}"
+
         self.fm.close_session(cid)
         sess = self.fm.create_session(filename, size, cid, is_upload=True, sock=tcp_sock)
         if not sess:
@@ -63,13 +70,13 @@ class CommandHandler:
         if offset > 0 and sess.file_handle:
             sess.transferred = offset
             sess.file_handle.seek(offset)
-        if proto == "UDP":
+        if proto == "UDP" and udp_sock is not None and udp_addr is not None:
             pkt = _HDR.pack(0, PacketType.CMD.value) + b"OK READY\n"
             try:
                 udp_sock.sendto(pkt, udp_addr)
             except OSError:
                 pass
-        else:
+        elif proto == "TCP" and tcp_sock is not None:
             send_all(tcp_sock, b"READY\n")
         return Response(True, "READY")
 
@@ -92,22 +99,30 @@ class CommandHandler:
             return Response(False, "File not found")
         fsize = self.fm.get_file_size(filename)
         remaining = fsize - offset
-        cid = f"{udp_addr[0]}:{udp_addr[1]}" if proto == "UDP" else str(tcp_sock.fileno())
+
+        # Безопасное создание client_id для UDP
+        if proto == "UDP" and udp_addr is not None:
+            cid = f"{udp_addr[0]}:{udp_addr[1]}"
+        elif proto == "UDP":
+            cid = f"udp_unknown_{time.time()}"
+        else:
+            cid = str(tcp_sock.fileno()) if tcp_sock else f"tcp_unknown_{time.time()}"
+
         self.fm.close_session(cid)
         sess = self.fm.create_session(filename, remaining, cid, is_upload=False, sock=tcp_sock)
         if not sess:
             return Response(False, "Cannot open file")
         if offset > 0 and sess.file_handle:
             sess.file_handle.seek(offset)
-        if proto == "UDP":
+        if proto == "UDP" and udp_addr is not None:
             sess.udp_client_addr = udp_addr
         info = f"FILE {remaining}"
-        if proto == "UDP":
+        if proto == "UDP" and udp_sock is not None and udp_addr is not None:
             pkt = _HDR.pack(0, PacketType.CMD.value) + f"OK {info}\n".encode()
             try:
                 udp_sock.sendto(pkt, udp_addr)
             except OSError:
                 pass
-        else:
+        elif proto == "TCP" and tcp_sock is not None:
             send_all(tcp_sock, f"{info}\n".encode())
         return Response(True, info)

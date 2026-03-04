@@ -2,6 +2,7 @@
 
 import socket
 import time
+import select
 from typing import Optional, Tuple, Callable
 
 
@@ -12,10 +13,10 @@ class ConnectionLostError(Exception):
 class RUDPSocket:
     def __init__(self, sock: socket.socket,
                  dest_addr: Optional[Tuple[str, int]] = None):
-        self.sock = sock
+        self.sock = sock  # Оставляем для совместимости, но не используем
         self.dest_addr = dest_addr
         # Создаем TCP сокет для реальной передачи
-        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock = None
         self.tcp_connected = False
 
         # Для отладки
@@ -23,12 +24,18 @@ class RUDPSocket:
         self.packets_received = 0
         self.retransmissions = 0
 
-    def _pack(self, seq: int, ptype: int, data: bytes = b"") -> bytes:
-        # Имитация UDP заголовка
-        return data
-
-    def _send_raw(self, data: bytes, addr: Tuple[str, int], retry=True) -> bool:
-        # Имитация отправки UDP пакета
+    def _ensure_connected(self):
+        """Убеждаемся, что TCP соединение установлено"""
+        if not self.tcp_connected and self.dest_addr:
+            try:
+                self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.tcp_sock.connect(self.dest_addr)
+                self.tcp_connected = True
+                # Читаем приветствие
+                welcome = self.tcp_sock.recv(1024)
+            except Exception as e:
+                print(f"TCP connection error: {e}")
+                return False
         return True
 
     # ── команды ───────────────────────────────────────
@@ -39,18 +46,21 @@ class RUDPSocket:
             raise RuntimeError("dest_addr not set")
 
         try:
-            if not self.tcp_connected:
-                self.tcp_sock.connect(self.dest_addr)
-                self.tcp_connected = True
-                # Читаем приветствие
-                self.tcp_sock.recv(1024)
+            if not self._ensure_connected():
+                return None
 
             # Отправляем команду
             self.tcp_sock.send((text + "\n").encode())
 
             # Получаем ответ
-            response = self.tcp_sock.recv(8192).decode().strip()
-            return response
+            response = b""
+            while b"\n" not in response:
+                chunk = self.tcp_sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+
+            return response.decode().strip()
 
         except Exception as e:
             print(f"TCP command error: {e}")
@@ -67,11 +77,8 @@ class RUDPSocket:
             raise RuntimeError("dest_addr not set")
 
         try:
-            if not self.tcp_connected:
-                self.tcp_sock.connect(self.dest_addr)
-                self.tcp_connected = True
-                # Читаем приветствие
-                self.tcp_sock.recv(1024)
+            if not self._ensure_connected():
+                raise ConnectionLostError("Cannot connect to server")
 
             cursor = 0
             last_progress = 0
@@ -93,7 +100,8 @@ class RUDPSocket:
                 # Небольшая задержка для имитации UDP
                 time.sleep(0.001)
 
-            progress_callback(total_size)
+            if progress_callback:
+                progress_callback(total_size)
 
         except Exception as e:
             raise ConnectionLostError(f"Send error: {e}")
@@ -106,11 +114,11 @@ class RUDPSocket:
                     progress_callback: Callable[[int], None] = None) -> int:
         """Получение файла через TCP"""
         try:
-            if not self.tcp_connected and self.dest_addr:
-                self.tcp_sock.connect(self.dest_addr)
-                self.tcp_connected = True
-                # Читаем приветствие
-                self.tcp_sock.recv(1024)
+            # Для получения файла мы должны уже иметь соединение
+            # или оно будет установлено отдельно через DOWNLOAD_PORT
+            if not self.tcp_connected:
+                print("TCP not connected for recv_stream")
+                return 0
 
             received = 0
             last_progress = 0
@@ -132,7 +140,9 @@ class RUDPSocket:
                 # Небольшая задержка для имитации UDP
                 time.sleep(0.001)
 
-            progress_callback(received)
+            if progress_callback:
+                progress_callback(received)
+
             return received
 
         except Exception as e:
