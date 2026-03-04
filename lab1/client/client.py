@@ -239,11 +239,11 @@ class FileTransferClient:
 
                 # Ждем порт от сервера
                 port_info = None
-                timeout = time.time() + 15  # Увеличен таймаут
+                timeout = time.time() + 30  # Увеличен таймаут до 30 секунд
                 print("Waiting for server download port...")
 
                 while time.time() < timeout:
-                    r, _, _ = select.select([self.udp_socket], [], [], 0.5)
+                    r, _, _ = select.select([self.udp_socket], [], [], 1.0)
                     if r:
                         try:
                             data, addr = self.udp_socket.recvfrom(65536)
@@ -254,7 +254,6 @@ class FileTransferClient:
                                 print(f"Got download port: {port}")
                                 break
                         except Exception as e:
-                            print(f"Error receiving port: {e}")
                             continue
 
                 if not port_info:
@@ -262,10 +261,17 @@ class FileTransferClient:
                     dl_sock.close()
                     return False
 
-                # Отправляем hello
+                # Отправляем hello несколько раз
                 print(f"Sending hello to {port_info}")
-                dl_sock.sendto(b"HELLO", port_info)
-                time.sleep(0.1)  # Небольшая пауза
+                for _ in range(10):
+                    try:
+                        dl_sock.sendto(b"HELLO", port_info)
+                    except:
+                        pass
+                    time.sleep(0.2)
+
+                # Небольшая пауза для установки соединения
+                time.sleep(0.5)
 
                 rudp = RUDPSocket(dl_sock, dest_addr=port_info)
                 with open(fp, mode) as f:

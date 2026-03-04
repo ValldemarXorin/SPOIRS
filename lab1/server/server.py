@@ -372,25 +372,31 @@ class TCPServer:
 
             print(f"[{_ts()}] UDP Download: {filename} → {addr[0]}:{addr[1]} port {dl_port}")
 
+            # Отправляем порт много раз с большими интервалами
             port_pkt = (
-                _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {dl_port}".encode()
+                    _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {dl_port}".encode()
             )
-            for _ in range(30):  # Увеличено количество попыток
+            for i in range(50):  # Еще больше попыток
                 try:
                     self.server_socket_udp.sendto(port_pkt, addr)
                 except OSError:
                     pass
-                time.sleep(0.05)  # Увеличена пауза
+                if i < 10:
+                    time.sleep(0.1)
+                else:
+                    time.sleep(0.5)  # Длинные паузы для надежности
 
             client_dl_addr = None
             t0 = time.monotonic()
-            while time.monotonic() - t0 < 15.0:  # Увеличен таймаут
-                r, _, _ = select.select([dl_sock], [], [], 0.2)
+            while time.monotonic() - t0 < 30.0:  # Увеличен таймаут до 30 секунд
+                r, _, _ = select.select([dl_sock], [], [], 1.0)
                 if r:
                     try:
-                        _, ca = dl_sock.recvfrom(65536)
-                        client_dl_addr = ca
-                        break
+                        data, ca = dl_sock.recvfrom(65536)
+                        if data == b"HELLO" or data == b"":
+                            client_dl_addr = ca
+                            print(f"[{_ts()}] Got hello from {ca}")
+                            break
                     except OSError:
                         continue
 
@@ -403,6 +409,11 @@ class TCPServer:
             print(f"[{_ts()}] UDP Download: streaming to {client_dl_addr}")
 
             try:
+                # Отправляем несколько пустых пакетов для инициализации
+                for _ in range(5):
+                    dl_sock.sendto(b"", client_dl_addr)
+                    time.sleep(0.1)
+
                 rudp = RUDPSocket(dl_sock, dest_addr=client_dl_addr)
                 rudp.send_stream(
                     file_handle,
