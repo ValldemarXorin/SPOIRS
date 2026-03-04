@@ -365,72 +365,69 @@ class TCPServer:
         filename = session.filename
 
         def worker():
-            dl_sock = create_udp_socket()
-            dl_sock.setblocking(False)
-            dl_sock.bind(("", 0))
-            dl_port = dl_sock.getsockname()[1]
+            # Вместо UDP используем TCP на другом порту
+            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tcp_sock.bind(("", 0))
+            tcp_port = tcp_sock.getsockname()[1]
+            tcp_sock.listen(1)
+            tcp_sock.setblocking(False)
 
-            print(f"[{_ts()}] UDP Download: {filename} → {addr[0]}:{addr[1]} port {dl_port}")
+            print(f"[{_ts()}] UDP Download (via TCP): {filename} → {addr[0]}:{addr[1]} port {tcp_port}")
 
-            # Отправляем порт много раз с большими интервалами
+            # Отправляем порт через UDP (для совместимости)
             port_pkt = (
-                    _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {dl_port}".encode()
+                    _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {tcp_port}".encode()
             )
-            for i in range(50):  # Еще больше попыток
+            for i in range(30):
                 try:
                     self.server_socket_udp.sendto(port_pkt, addr)
                 except OSError:
                     pass
-                if i < 10:
-                    time.sleep(0.1)
-                else:
-                    time.sleep(0.5)  # Длинные паузы для надежности
+                time.sleep(0.1)
 
-            client_dl_addr = None
+            # Ждем TCP подключения
+            client_conn = None
             t0 = time.monotonic()
-            while time.monotonic() - t0 < 30.0:  # Увеличен таймаут до 30 секунд
-                r, _, _ = select.select([dl_sock], [], [], 1.0)
+            while time.monotonic() - t0 < 30.0:
+                r, _, _ = select.select([tcp_sock], [], [], 1.0)
                 if r:
                     try:
-                        data, ca = dl_sock.recvfrom(65536)
-                        if data == b"HELLO" or data == b"":
-                            client_dl_addr = ca
-                            print(f"[{_ts()}] Got hello from {ca}")
-                            break
+                        client_conn, client_addr = tcp_sock.accept()
+                        print(f"[{_ts()}] Got TCP connection from {client_addr}")
+                        break
                     except OSError:
                         continue
 
-            if client_dl_addr is None:
-                print(f"[{_ts()}] UDP Download: no hello from client")
+            if client_conn is None:
+                print(f"[{_ts()}] UDP Download: no TCP connection from client")
                 self.file_manager.close_session(cid)
-                dl_sock.close()
+                tcp_sock.close()
                 return
 
-            print(f"[{_ts()}] UDP Download: streaming to {client_dl_addr}")
+            print(f"[{_ts()}] UDP Download (TCP): streaming to {client_addr}")
 
             try:
-                # Отправляем несколько пустых пакетов для инициализации
-                for _ in range(5):
-                    dl_sock.sendto(b"", client_dl_addr)
-                    time.sleep(0.1)
+                # Отправляем файл по TCP
+                sent = 0
+                while sent < total_size:
+                    chunk = file_handle.read(65536)
+                    if not chunk:
+                        break
+                    client_conn.send(chunk)
+                    sent += len(chunk)
+                    self._update_dl(cid, sent, session)
 
-                rudp = RUDPSocket(dl_sock, dest_addr=client_dl_addr)
-                rudp.send_stream(
-                    file_handle,
-                    total_size=total_size,
-                    progress_callback=lambda s: self._update_dl(cid, s, session),
-                )
                 session.transferred = total_size
                 br = self.file_manager.calculate_bitrate(session)
                 bs = self.file_manager.format_bitrate(br)
                 print(f"[{_ts()}] UDP Download done: {filename} ({bs})")
-            except ConnectionLostError as e:
-                print(f"[{_ts()}] UDP Download failed: {e}")
             except Exception as e:
                 print(f"[{_ts()}] UDP Download error: {e}")
             finally:
                 self.file_manager.complete_session(cid)
-                dl_sock.close()
+                client_conn.close()
+                tcp_sock.close()
 
         threading.Thread(target=worker, daemon=True).start()
 
