@@ -10,7 +10,7 @@ def main():
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind')
     parser.add_argument('--port', type=int, default=9000, help='Port to bind')
     args = parser.parse_args()
-    
+
     server = TCPServer(args.host, args.port)
     server.start()
 

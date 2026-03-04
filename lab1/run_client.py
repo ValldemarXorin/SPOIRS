@@ -10,7 +10,7 @@ def main():
     parser.add_argument('host', help='Server host')
     parser.add_argument('--port', type=int, default=9000, help='Server port')
     args = parser.parse_args()
-    
+
     client = InteractiveClient(args.host, args.port)
     client.run()
 

@@ -13,11 +13,11 @@ class TransferSession:
     total_size: int
     transferred: int
     start_time: float
-    client_id: str       # IP:Port string
+    client_id: str
     is_upload: bool = True
     temp_path: Optional[str] = None
     file_handle: Optional[Any] = None
-    sock: Optional[Any] = None  # TCP socket
+    sock: Optional[Any] = None
 
     # UDP upload (server receive)
     expected_seq: int = 0
@@ -30,7 +30,7 @@ class TransferSession:
     udp_eof: bool = False
     udp_last_ack_time: float = 0.0
 
-    # FIN state (download)
+    # FIN state
     udp_fin_sent: bool = False
     udp_fin_seq: int = 0
     udp_fin_acked: bool = False
@@ -38,6 +38,9 @@ class TransferSession:
     udp_fin_tries: int = 0
 
     last_activity: float = 0.0
+
+    # logging helper
+    _last_pct: int = -10
 
 
 class FileManager:
@@ -54,7 +57,7 @@ class FileManager:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
     def _sanitize_addr(self, client_addr: str) -> str:
-        return client_addr.replace(":", "_")
+        return client_addr.replace(":", "_").replace("/", "_")
 
     def get_file_path(self, filename: str) -> Path:
         safe_name = Path(filename).name
@@ -78,17 +81,18 @@ class FileManager:
         """Создаёт сессию передачи файла."""
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
 
+        now = time.time()
         session = TransferSession(
             filename=filename,
             total_size=total_size,
             transferred=0,
-            start_time=time.time(),
+            start_time=now,
             client_id=client_id,
             is_upload=is_upload,
             temp_path=temp_path,
             sock=sock,
-            last_activity=time.time(),
-            udp_last_ack_time=time.time(),
+            last_activity=now,
+            udp_last_ack_time=now,
         )
 
         try:
