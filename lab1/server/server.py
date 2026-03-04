@@ -225,8 +225,7 @@ class TCPServer:
     def _udp_read(self) -> None:
         if not self.server_socket_udp:
             return
-        # Читаем все доступные пакеты за раз
-        for _ in range(16384):  # Увеличено количество за раз
+        for _ in range(16384):
             try:
                 pkt, addr = self.server_socket_udp.recvfrom(65536)
             except (BlockingIOError, OSError):
@@ -273,14 +272,96 @@ class TCPServer:
                     self.server_socket_udp.sendto(ep, addr)
                 except OSError:
                     pass
-            elif cmd.type in (CommandType.DOWNLOAD, CommandType.RESUME_DOWNLOAD):
-                self._start_udp_download(cid, addr)
+            else:
+                if cmd.type in (CommandType.DOWNLOAD, CommandType.RESUME_DOWNLOAD):
+                    self._start_udp_download(cid, addr)
+                elif cmd.type in (CommandType.UPLOAD, CommandType.RESUME_UPLOAD):
+                    if cmd.type == CommandType.UPLOAD:
+                        filename = cmd.args[0]
+                        size = int(cmd.args[1])
+                        offset = 0
+                    else:  # RESUME_UPLOAD
+                        filename = cmd.args[0]
+                        offset = int(cmd.args[1])
+                        size = int(cmd.args[2])
+                    self._start_udp_upload(cid, addr, filename, size, offset)
         else:
             rp = _HDR.pack(0, PacketType.CMD.value) + format_response(resp)
             try:
                 self.server_socket_udp.sendto(rp, addr)
             except OSError:
                 pass
+
+    def _start_udp_upload(self, cid, addr, filename, total_size, offset=0):
+        session = self.file_manager.get_session(cid)
+        if not session or not session.is_upload:
+            return
+
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind(("", 0))
+        tcp_port = tcp_sock.getsockname()[1]
+        tcp_sock.listen(1)
+        tcp_sock.setblocking(False)
+
+        print(f"[{_ts()}] UDP Upload (via TCP): {filename} ← {addr[0]}:{addr[1]} port {tcp_port}")
+
+        port_pkt = _HDR.pack(0, PacketType.CMD.value) + f"UPLOAD_PORT {tcp_port}".encode()
+        for i in range(30):
+            try:
+                self.server_socket_udp.sendto(port_pkt, addr)
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+        client_conn = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 30.0:
+            r, _, _ = select.select([tcp_sock], [], [], 1.0)
+            if r:
+                try:
+                    client_conn, client_addr = tcp_sock.accept()
+                    print(f"[{_ts()}] Got TCP connection from {client_addr} for upload")
+                    break
+                except OSError:
+                    continue
+
+        if client_conn is None:
+            print(f"[{_ts()}] UDP Upload: no TCP connection from client")
+            self.file_manager.close_session(cid)
+            tcp_sock.close()
+            return
+
+        try:
+            received = 0
+            file_handle = session.file_handle
+            while received < total_size:
+                chunk = client_conn.recv(65536)
+                if not chunk:
+                    break
+                file_handle.write(chunk)
+                received += len(chunk)
+                session.transferred = offset + received
+                self._log(cid, session, "UDP Upload")
+
+            if received >= total_size:
+                br = self.file_manager.calculate_bitrate(session)
+                bs = self.file_manager.format_bitrate(br)
+                self.file_manager.complete_session(cid)
+                try:
+                    client_conn.send(b"OK\n")
+                except:
+                    pass
+                print(f"[{_ts()}] UDP Upload done: {filename} ({bs})")
+            else:
+                print(f"[{_ts()}] UDP Upload incomplete: {received}/{total_size}")
+                self.file_manager.close_session(cid)
+        except Exception as e:
+            print(f"[{_ts()}] UDP Upload error: {e}")
+            self.file_manager.close_session(cid)
+        finally:
+            client_conn.close()
+            tcp_sock.close()
 
     def _udp_data(self, cid, seq, data, addr) -> None:
         session = self.file_manager.get_session(cid)
@@ -310,7 +391,6 @@ class TCPServer:
         elif seq > session.expected_seq:
             if seq < session.expected_seq + UDP_WINDOW_SIZE * 2:
                 session.udp_recv_buffer[seq] = data
-            # Отправляем NACK для пропущенного пакета
             nack = _HDR.pack(session.expected_seq, PacketType.NACK.value)
             try:
                 self.server_socket_udp.sendto(nack, addr)
@@ -319,12 +399,12 @@ class TCPServer:
 
     def _udp_fin(self, cid, seq, addr) -> None:
         fin_ack = _HDR.pack(seq + 1, PacketType.ACK.value)
-        for _ in range(10):  # Увеличено количество попыток
+        for _ in range(10):
             try:
                 self.server_socket_udp.sendto(fin_ack, addr)
             except OSError:
                 pass
-            time.sleep(0.01)  # Небольшая пауза между попытками
+            time.sleep(0.01)
         session = self.file_manager.get_session(cid)
         if session and session.is_upload:
             br = self.file_manager.calculate_bitrate(session)
@@ -337,7 +417,7 @@ class TCPServer:
         for cid, sess in list(self.file_manager.sessions.items()):
             if not sess.is_upload or ":" not in cid or cid.isdigit():
                 continue
-            if now - sess.udp_last_ack_time < UDP_ACK_INTERVAL * 0.1:  # Более частая отправка ACK
+            if now - sess.udp_last_ack_time < UDP_ACK_INTERVAL * 0.1:
                 continue
             parts = cid.rsplit(":", 1)
             if len(parts) != 2:
@@ -365,7 +445,6 @@ class TCPServer:
         filename = session.filename
 
         def worker():
-            # Вместо UDP используем TCP на другом порту
             tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             tcp_sock.bind(("", 0))
@@ -375,10 +454,7 @@ class TCPServer:
 
             print(f"[{_ts()}] UDP Download (via TCP): {filename} → {addr[0]}:{addr[1]} port {tcp_port}")
 
-            # Отправляем порт через UDP (для совместимости)
-            port_pkt = (
-                    _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {tcp_port}".encode()
-            )
+            port_pkt = _HDR.pack(0, PacketType.CMD.value) + f"DOWNLOAD_PORT {tcp_port}".encode()
             for i in range(30):
                 try:
                     self.server_socket_udp.sendto(port_pkt, addr)
@@ -386,7 +462,6 @@ class TCPServer:
                     pass
                 time.sleep(0.1)
 
-            # Ждем TCP подключения
             client_conn = None
             t0 = time.monotonic()
             while time.monotonic() - t0 < 30.0:
@@ -408,7 +483,6 @@ class TCPServer:
             print(f"[{_ts()}] UDP Download (TCP): streaming to {client_addr}")
 
             try:
-                # Отправляем файл по TCP
                 sent = 0
                 while sent < total_size:
                     chunk = file_handle.read(65536)
@@ -463,14 +537,12 @@ class TCPServer:
             pass
 
 
-# ── process-pool manager (os.fork, вариант 12) ────────────
-
+# ── process-pool manager ────────────────────────────
 
 def main() -> None:
     host = "0.0.0.0"
     port = 9000
 
-    # master создаёт сокеты до fork — дети наследуют их автоматически
     tcp_sock = create_server_socket(host, port)
     tcp_sock.setblocking(False)
 
@@ -491,11 +563,9 @@ def main() -> None:
     def spawn_worker() -> None:
         pid = os.fork()
         if pid == 0:
-            # дочерний процесс — запускаем воркер
             srv = TCPServer(tcp_sock, udp_sock, host=host, port=port)
             srv.start()
             sys.exit(0)
-        # мастер
         worker_pids.append(pid)
         print(f"[{_ts()}] Spawned worker PID={pid}")
 
@@ -525,10 +595,8 @@ def main() -> None:
     for _ in range(WORKER_MIN):
         spawn_worker()
 
-    # менеджер пула
     try:
         while True:
-            # собираем завершившихся воркеров
             while True:
                 try:
                     pid, status = os.waitpid(-1, os.WNOHANG)
@@ -541,11 +609,9 @@ def main() -> None:
                 except ChildProcessError:
                     break
 
-            # доливаем до WORKER_MIN
             while len(worker_pids) < WORKER_MIN:
                 spawn_worker()
 
-            # обрезаем до WORKER_MAX
             while len(worker_pids) > WORKER_MAX:
                 extra_pid = worker_pids.pop()
                 try:

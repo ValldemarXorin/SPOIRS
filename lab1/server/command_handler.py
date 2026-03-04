@@ -2,6 +2,7 @@
 
 import struct
 from datetime import datetime
+import time  # добавлено для time.time() в случае неизвестного адреса
 
 from common.protocol import (
     Command, CommandType, Response, PacketType, format_response
@@ -70,13 +71,8 @@ class CommandHandler:
         if offset > 0 and sess.file_handle:
             sess.transferred = offset
             sess.file_handle.seek(offset)
-        if proto == "UDP" and udp_sock is not None and udp_addr is not None:
-            pkt = _HDR.pack(0, PacketType.CMD.value) + b"OK READY\n"
-            try:
-                udp_sock.sendto(pkt, udp_addr)
-            except OSError:
-                pass
-        elif proto == "TCP" and tcp_sock is not None:
+        # Для TCP сразу отправляем READY, для UDP ответ придёт позже с портом
+        if proto == "TCP" and tcp_sock is not None:
             send_all(tcp_sock, b"READY\n")
         return Response(True, "READY")
 
@@ -100,7 +96,6 @@ class CommandHandler:
         fsize = self.fm.get_file_size(filename)
         remaining = fsize - offset
 
-        # Безопасное создание client_id для UDP
         if proto == "UDP" and udp_addr is not None:
             cid = f"{udp_addr[0]}:{udp_addr[1]}"
         elif proto == "UDP":
@@ -117,12 +112,6 @@ class CommandHandler:
         if proto == "UDP" and udp_addr is not None:
             sess.udp_client_addr = udp_addr
         info = f"FILE {remaining}"
-        if proto == "UDP" and udp_sock is not None and udp_addr is not None:
-            pkt = _HDR.pack(0, PacketType.CMD.value) + f"OK {info}\n".encode()
-            try:
-                udp_sock.sendto(pkt, udp_addr)
-            except OSError:
-                pass
-        elif proto == "TCP" and tcp_sock is not None:
+        if proto == "TCP" and tcp_sock is not None:
             send_all(tcp_sock, f"{info}\n".encode())
         return Response(True, info)

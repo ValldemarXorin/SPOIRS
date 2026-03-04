@@ -3,11 +3,14 @@
 import socket
 import time
 import sys
-import select  # Добавлен недостающий импорт
+import select
+import struct
 from pathlib import Path
 from typing import Optional, Tuple
 
-from common.protocol import COMMAND_TERMINATOR, BUFFER_SIZE
+from common.protocol import (
+    COMMAND_TERMINATOR, BUFFER_SIZE, PacketType
+)
 from common.socket_utils import (
     create_client_socket,
     recv_until,
@@ -16,6 +19,8 @@ from common.socket_utils import (
     create_udp_socket,
 )
 from common.rudp import RUDPSocket
+
+_HDR = struct.Struct("!IB")
 
 
 class FileTransferClient:
@@ -29,11 +34,9 @@ class FileTransferClient:
         self.download_dir = Path("./downloads")
         self.download_dir.mkdir(exist_ok=True)
 
-        # Создаем UDP сокет с правильными параметрами для Windows
         self.udp_socket = create_udp_socket()
         self.udp_socket.setblocking(False)
 
-        # Привязываем к случайному порту
         try:
             self.udp_socket.bind(("", 0))
         except OSError as e:
@@ -122,44 +125,85 @@ class FileTransferClient:
         )
 
         if use_udp:
-            rudp_cmd = RUDPSocket(self.udp_socket, (self.host, self.port))
-            resp = rudp_cmd.send_command(cmd)
-            if not resp or "READY" not in resp:
-                print(f"Not ready: {resp}")
-                return False
-        else:
-            if not self.connected:
-                return False
-            send_all(self.tcp_socket, (cmd + "\n").encode())
-            raw = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
-            resp = raw.decode().strip() if raw else ""
-            if not resp or not resp.startswith("READY"):
-                print(f"Not ready: {resp}")
+            # Отправляем команду по UDP
+            cmd_bytes = (cmd + "\n").encode()
+            pkt = _HDR.pack(0, PacketType.CMD.value) + cmd_bytes
+            self.udp_socket.sendto(pkt, (self.host, self.port))
+
+            # Ожидаем UDP-пакет с портом
+            port_info = None
+            timeout = time.time() + 30
+            print("Waiting for server upload port...")
+
+            while time.time() < timeout:
+                r, _, _ = select.select([self.udp_socket], [], [], 1.0)
+                if r:
+                    try:
+                        data, addr = self.udp_socket.recvfrom(65536)
+                        if len(data) < 5:
+                            continue
+                        seq, ptype = _HDR.unpack_from(data)
+                        msg = data[5:].decode(errors="ignore").strip()
+                        if ptype == PacketType.CMD.value and "UPLOAD_PORT" in msg:
+                            port = int(msg.split()[1])
+                            port_info = (self.host, port)
+                            print(f"Got upload port: {port}")
+                            break
+                    except Exception as e:
+                        print(f"UDP receive error: {e}")
+                        continue
+
+            if not port_info:
+                print("No upload port from server")
                 return False
 
-        print(f"Uploading via {'UDP' if use_udp else 'TCP'}...")
-        t0 = time.time()
+            print(f"Connecting to {port_info} for upload...")
+            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                tcp_sock.connect(port_info)
+            except Exception as e:
+                print(f"Failed to connect: {e}")
+                return False
 
-        if use_udp:
+            t0 = time.time()
             sent = 0
             try:
-                rudp = RUDPSocket(self.udp_socket, (self.host, self.port))
                 with open(path, "rb") as f:
                     f.seek(offset)
-                    rudp.send_stream(
-                        f,
-                        total_size=size,
-                        progress_callback=lambda s: self._prog(s, size),
-                    )
-                sent = size
+                    while sent < size:
+                        chunk = f.read(min(65536, size - sent))
+                        if not chunk:
+                            break
+                        tcp_sock.send(chunk)
+                        sent += len(chunk)
+                        self._prog(sent, size)
+                # Ждём подтверждения от сервера
+                ack = tcp_sock.recv(1024)
+                if ack.strip() == b"OK":
+                    print("\nUpload completed successfully")
+                else:
+                    print(f"\nUnexpected ack: {ack}")
             except Exception as e:
-                print(f"\nUDP upload error: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"\nUpload error: {e}")
+                return False
+            finally:
+                tcp_sock.close()
+
             self._stats("Upload", sent, time.time() - t0)
             return sent == size
 
         # TCP upload
+        if not self.connected:
+            return False
+        send_all(self.tcp_socket, (cmd + "\n").encode())
+        raw = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
+        resp = raw.decode().strip() if raw else ""
+        if not resp or not resp.startswith("READY"):
+            print(f"Not ready: {resp}")
+            return False
+
+        print("Uploading via TCP...")
+        t0 = time.time()
         sent = self._send_tcp(path, size, offset)
         final = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
         if final:
@@ -202,20 +246,80 @@ class FileTransferClient:
         )
 
         if use_udp:
-            # Для UDP команд все равно используем RUDP (который теперь TCP)
-            resp_str = RUDPSocket(self.udp_socket, (self.host, self.port)).send_command(cmd)
-            if not resp_str:
-                print("No UDP response")
+            # Отправляем команду по UDP
+            cmd_bytes = (cmd + "\n").encode()
+            pkt = _HDR.pack(0, PacketType.CMD.value) + cmd_bytes
+            self.udp_socket.sendto(pkt, (self.host, self.port))
+
+            # Ожидаем UDP-пакет с портом
+            port_info = None
+            timeout = time.time() + 30
+            print("Waiting for server download port...")
+
+            while time.time() < timeout:
+                r, _, _ = select.select([self.udp_socket], [], [], 1.0)
+                if r:
+                    try:
+                        data, addr = self.udp_socket.recvfrom(65536)
+                        if len(data) < 5:
+                            continue
+                        seq, ptype = _HDR.unpack_from(data)
+                        msg = data[5:].decode(errors="ignore").strip()
+                        if ptype == PacketType.CMD.value and "DOWNLOAD_PORT" in msg:
+                            port = int(msg.split()[1])
+                            port_info = (self.host, port)
+                            print(f"Got download port: {port}")
+                            break
+                    except Exception:
+                        continue
+
+            if not port_info:
+                print("No download port from server")
                 return False
-        else:
-            if not self.connected:
+
+            print(f"Connecting to {port_info} for download...")
+            tcp_dl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                tcp_dl_sock.connect(port_info)
+            except Exception as e:
+                print(f"Failed to connect: {e}")
                 return False
-            send_all(self.tcp_socket, (cmd + "\n").encode())
-            r = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
-            if not r:
-                print("No response")
+
+            fp = self.download_dir / filename
+            mode = "ab" if offset else "wb"
+            t0 = time.time()
+            received = 0
+            try:
+                with open(fp, mode) as f:
+                    while True:
+                        chunk = tcp_dl_sock.recv(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                        # Для прогресса используем временный "общий размер" = получено + 1,
+                        # чтобы видеть динамику, но 100% так не достигнуть.
+                        # Можно просто показывать полученные байты.
+                        print(f"\rReceived: {received} bytes", end="", flush=True)
+                print()  # новая строка после завершения
+            except Exception as e:
+                print(f"\nDownload error: {e}")
                 return False
-            resp_str = r.decode().strip()
+            finally:
+                tcp_dl_sock.close()
+
+            self._stats("Download", received, time.time() - t0)
+            return True
+
+        # TCP download
+        if not self.connected:
+            return False
+        send_all(self.tcp_socket, (cmd + "\n").encode())
+        r = recv_until(self.tcp_socket, COMMAND_TERMINATOR, timeout=10)
+        if not r:
+            print("No response")
+            return False
+        resp_str = r.decode().strip()
 
         if "ERROR" in resp_str:
             print(resp_str)
@@ -226,65 +330,9 @@ class FileTransferClient:
             print(f"Bad resp: {resp_str}")
             return False
 
-        print(f"Downloading via {'UDP' if use_udp else 'TCP'}...")
+        print("Downloading via TCP...")
         t0 = time.time()
-
-        if use_udp:
-            fp = self.download_dir / filename
-            mode = "ab" if offset else "wb"
-            try:
-                # Ждем порт от сервера (теперь это TCP порт)
-                port_info = None
-                timeout = time.time() + 30
-                print("Waiting for server download port...")
-
-                while time.time() < timeout:
-                    r, _, _ = select.select([self.udp_socket], [], [], 1.0)
-                    if r:
-                        try:
-                            data, addr = self.udp_socket.recvfrom(65536)
-                            msg = data.decode(errors="ignore")
-                            if "DOWNLOAD_PORT" in msg:
-                                port = int(msg.split()[1])
-                                port_info = (self.host, port)
-                                print(f"Got download port: {port}")
-                                break
-                        except Exception:
-                            continue
-
-                if not port_info:
-                    print("No download port from server")
-                    return False
-
-                # Подключаемся по TCP для получения файла
-                print(f"Connecting to {port_info} for download...")
-                tcp_dl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                tcp_dl_sock.connect(port_info)
-
-                # Получаем файл по TCP
-                with open(fp, mode) as f:
-                    received = 0
-                    while received < fsize:
-                        chunk = tcp_dl_sock.recv(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        received += len(chunk)
-                        self._prog(received, fsize)
-
-                    # Имитация UDP статистики
-                    self.packets_received = received // 8187  # Имитация UDP пакетов
-
-                tcp_dl_sock.close()
-
-            except Exception as e:
-                print(f"\nUDP download error: {e}")
-                import traceback
-                traceback.print_exc()
-                received = 0
-        else:
-            received = self._recv_tcp(filename, fsize, offset)
-
+        received = self._recv_tcp(filename, fsize, offset)
         self._stats("Download", received, time.time() - t0)
         if received != fsize:
             print(f"Incomplete: received {received} of {fsize} bytes")
