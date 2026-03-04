@@ -1,4 +1,4 @@
-"""Утилиты для работы с сокетами — кроссплатформенные (Windows + Linux)."""
+"""Утилиты для работы с сокетами — Windows + Linux."""
 
 import socket
 import select
@@ -37,13 +37,12 @@ def _configure_keepalive(sock: socket.socket) -> None:
             pass
 
 
-def create_udp_socket(buf_size: int = 32 * 1024 * 1024) -> socket.socket:
-    """Создаёт UDP сокет с максимально увеличенными буферами."""
+def create_udp_socket(buf_size: int = 8 * 1024 * 1024) -> socket.socket:
+    """UDP сокет с увеличенными буферами."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Пробуем установить большой буфер, уменьшая если OS не даёт
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
         target = buf_size
-        while target >= 1024 * 1024:
+        while target >= 256 * 1024:
             try:
                 sock.setsockopt(socket.SOL_SOCKET, opt, target)
                 break
@@ -62,9 +61,7 @@ def recv_until(sock: socket.socket, terminator: bytes,
             if not chunk:
                 return None
             buffer += chunk
-    except socket.timeout:
-        return None
-    except OSError:
+    except (socket.timeout, OSError):
         return None
     return buffer
 
@@ -75,14 +72,11 @@ def recv_exact(sock: socket.socket, size: int,
     sock.settimeout(timeout)
     try:
         while len(buffer) < size:
-            remaining = size - len(buffer)
-            chunk = sock.recv(min(remaining, 65536))
+            chunk = sock.recv(min(size - len(buffer), 65536))
             if not chunk:
                 return None
             buffer += chunk
-    except socket.timeout:
-        return None
-    except OSError:
+    except (socket.timeout, OSError):
         return None
     return buffer
 

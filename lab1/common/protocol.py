@@ -44,22 +44,17 @@ BUFFER_SIZE = 1024 * 1024
 ENCODING = "utf-8"
 
 # ── UDP ─────────────────────────────────────────────────
-# Размер пакета: 65507 - максимум для UDP, но фрагментация IP плоха.
-# Для localhost/LAN без фрагментации:
-#   - Стандартный Ethernet MTU=1500 → payload 1472 (без фрагментации)
-#   - Jumbo frame MTU=9000 → payload ~8960
-#   - Localhost: MTU=65535, фрагментация в kernel быстрая
-# Для максимальной скорости на localhost используем крупные пакеты,
-# kernel сам разберёт фрагментацию эффективнее чем мы по 1472.
-UDP_PACKET_SIZE = 32768          # 32KB payload+header
-UDP_HEADER_SIZE = 5              # 4 bytes seq + 1 byte type
-UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 32763
+# 8192 — помещается в jumbo frame (MTU 9000) без IP-фрагментации
+# Header: 4 bytes seq + 1 byte type = 5 bytes
+UDP_PACKET_SIZE = 8192
+UDP_HEADER_SIZE = 5
+UDP_PAYLOAD_SIZE = UDP_PACKET_SIZE - UDP_HEADER_SIZE  # 8187
 
-UDP_WINDOW_SIZE = 2048           # пакетов в скользящем окне (≈64MB in flight)
-UDP_TIMEOUT = 0.05               # retransmit timeout — агрессивный
+# Окно: 4096 пакетов × 8KB ≈ 32MB in flight
+UDP_WINDOW_SIZE = 4096
+UDP_TIMEOUT = 0.2
 UDP_RETRY_LIMIT = 40
-UDP_ACK_INTERVAL = 64            # ACK каждые N пакетов
-UDP_BURST_SIZE = 256             # пакетов за одну итерацию send
+UDP_ACK_INTERVAL = 32   # ACK каждые 32 пакета — часто!
 
 
 def parse_command(raw_line: str, default_proto: str = "TCP") -> Command:

@@ -58,11 +58,9 @@ class FileManager:
         path = self.get_file_path(filename)
         return path.stat().st_size if path.exists() else 0
 
-    def create_session(self, filename: str, total_size: int,
-                       client_id: str, is_upload: bool,
-                       sock=None) -> Optional[TransferSession]:
+    def create_session(self, filename, total_size, client_id, is_upload,
+                       sock=None):
         temp_path = str(self.get_temp_path(filename, client_id)) if is_upload else None
-
         now = time.time()
         session = TransferSession(
             filename=filename, total_size=total_size,
@@ -70,23 +68,21 @@ class FileManager:
             is_upload=is_upload, temp_path=temp_path, sock=sock,
             last_activity=now, udp_last_ack_time=now,
         )
-
         try:
             if is_upload:
                 session.file_handle = open(temp_path, 'wb')
             else:
                 session.file_handle = open(self.get_file_path(filename), 'rb')
         except IOError as e:
-            print(f"Error opening file for session: {e}")
+            print(f"Error opening file: {e}")
             return None
-
         self.sessions[client_id] = session
         return session
 
-    def get_session(self, client_id: str) -> Optional[TransferSession]:
+    def get_session(self, client_id):
         return self.sessions.get(client_id)
 
-    def close_session(self, client_id: str) -> None:
+    def close_session(self, client_id):
         session = self.sessions.get(client_id)
         if session and session.file_handle:
             try:
@@ -95,7 +91,7 @@ class FileManager:
                 pass
         self.sessions.pop(client_id, None)
 
-    def complete_session(self, client_id: str) -> None:
+    def complete_session(self, client_id):
         session = self.sessions.get(client_id)
         if not session:
             return
@@ -105,22 +101,20 @@ class FileManager:
             except Exception:
                 pass
             session.file_handle = None
-
         if session.is_upload and session.temp_path:
-            temp_path = Path(session.temp_path)
-            final_path = self.get_file_path(session.filename)
-            if temp_path.exists():
-                if final_path.exists():
-                    final_path.unlink()
-                temp_path.rename(final_path)
-
+            tp = Path(session.temp_path)
+            fp = self.get_file_path(session.filename)
+            if tp.exists():
+                if fp.exists():
+                    fp.unlink()
+                tp.rename(fp)
         self.sessions.pop(client_id, None)
 
-    def calculate_bitrate(self, session: TransferSession) -> float:
+    def calculate_bitrate(self, session):
         elapsed = time.time() - session.start_time
         return session.transferred / elapsed if elapsed > 0 else 0.0
 
-    def format_bitrate(self, bitrate: float) -> str:
+    def format_bitrate(self, bitrate):
         if bitrate >= 1024 * 1024:
             return f"{bitrate / (1024 * 1024):.2f} MB/s"
         if bitrate >= 1024:
