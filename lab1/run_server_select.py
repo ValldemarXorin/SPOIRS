@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Сервер на мультиплексировании (select), без потоков и процессов."""
+
+import argparse
+from server.server_select import main
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="FTP Server (select multiplexing)")
+    p.add_argument('--host', default='0.0.0.0')
+    p.add_argument('--port', type=int, default=9000)
+    a = p.parse_args()
+    main(a.host, a.port)
