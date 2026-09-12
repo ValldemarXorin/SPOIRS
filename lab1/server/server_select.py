@@ -52,7 +52,7 @@ class SelectServer:
         self.server_socket_udp.setblocking(False)
 
         self.file_manager = FileManager()
-        self.command_handler = CommandHandler(self.file_manager)
+        self.command_handler = CommandHandler(self.file_manager, self.server_socket_udp)
 
         self.inputs: List[socket.socket] = [self.server_socket_tcp, self.server_socket_udp]
         self.outputs: List[socket.socket] = []

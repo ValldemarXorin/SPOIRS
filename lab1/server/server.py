@@ -53,7 +53,7 @@ class TCPServer:
         self.server_socket_udp: socket.socket = udp_sock
 
         self.file_manager = FileManager()
-        self.command_handler = CommandHandler(self.file_manager)
+        self.command_handler = CommandHandler(self.file_manager, self.server_socket_udp)
 
         self.inputs: List[socket.socket] = [self.server_socket_tcp, self.server_socket_udp]
         self.outputs: List[socket.socket] = []

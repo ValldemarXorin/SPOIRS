@@ -53,7 +53,7 @@ class ThreadedServer:
         self.server_socket_udp.setblocking(False)
 
         self.file_manager = FileManager()
-        self.command_handler = CommandHandler(self.file_manager)
+        self.command_handler = CommandHandler(self.file_manager, self.server_socket_udp)
 
         self.lock = threading.Lock()
         self.client_threads: list = []
