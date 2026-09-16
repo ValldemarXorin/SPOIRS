@@ -1,6 +1,7 @@
 """Traceroute implementation using ICMP Time Exceeded."""
 
 import socket
+import sys
 import time
 import struct
 import random
@@ -50,6 +51,13 @@ class Traceroute:
         """Run traceroute."""
         print(f"traceroute to {self.host} ({self.target_ip}), "
               f"{self.max_hops} hops max, {self.probes} probes per hop")
+
+        # Windows raw ICMP sockets ignore IP_TTL (and IPPROTO_RAW/IP_HDRINCL
+        # is blocked without extra privileges) -> TTL-based hop discovery fails.
+        if sys.platform == "win32":
+            print("[WARN] Windows raw ICMP sockets ignore IP_TTL: TTL-based "
+                  "traceroute may not show hops. Linux is recommended; "
+                  "ping still works on Windows.")
 
         results = []
 

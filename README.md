@@ -140,6 +140,11 @@ python -m lab5 smurf --wireshark-help
 sudo python -m lab5 smurf --victim 192.168.1.10 --broadcast 192.168.1.255
 ```
 
+> **⚠️ Windows limitation:** на Windows raw ICMP сокеты игнорируют `IP_TTL`, а
+> `IPPROTO_RAW`+`IP_HDRINCL` (для самостоятельной сборки IP-заголовка) часто
+> заблокированы. Поэтому **ping работает, а traceroute может не показать хопы**.
+> Для полной демонстрации traceroute используйте Linux.
+
 ---
 
 ### [ЛР6](./lab6/) — P2P чат: Broadcast + Multicast

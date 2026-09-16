@@ -94,7 +94,7 @@ class IPHeader:
         if len(data) < header_len:
             raise ValueError("IP header truncated")
 
-        tos, total_length, id_, flags_frag, ttl, protocol, checksum, src, dst = struct.unpack(
+        version_ihl2, tos, total_length, id_, flags_frag, ttl, protocol, checksum, src, dst = struct.unpack(
             "!BBHHHBBHII", data[:20]
         )
         flags = (flags_frag >> 13) & 0x7

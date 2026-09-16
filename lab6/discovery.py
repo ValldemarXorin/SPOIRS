@@ -30,12 +30,14 @@ class PeerDiscovery:
         self,
         local_ip: str,
         local_name: str,
+        instance_id: Optional[str] = None,
         hello_interval: float = 5.0,
         peer_timeout: float = 30.0,
         send_callback: Optional[Callable[[ChatMessage, bool], None]] = None,
     ):
         self.local_ip = local_ip
         self.local_name = local_name
+        self.instance_id = instance_id or "local"
         self.hello_interval = hello_interval
         self.peer_timeout = peer_timeout
         self.send_callback = send_callback  # (message, is_broadcast) -> None
@@ -65,7 +67,8 @@ class PeerDiscovery:
         if self._cleanup_thread:
             self._cleanup_thread.join(timeout=1.0)
         # Send BYE
-        bye = ChatMessage.create_bye(self.local_ip, self.local_name, self._next_seq())
+        bye = ChatMessage.create_bye(self.local_ip, self.local_name, self._next_seq(),
+                                     instance_id=self.instance_id)
         self._send(bye, broadcast=True)
         self._send(bye, broadcast=False)
 
@@ -86,7 +89,8 @@ class PeerDiscovery:
                 self._cleanup_expired()
 
     def _send_hello(self) -> None:
-        hello = ChatMessage.create_hello(self.local_ip, self.local_name, self._next_seq())
+        hello = ChatMessage.create_hello(self.local_ip, self.local_name, self._next_seq(),
+                                         instance_id=self.instance_id)
         self._send(hello, broadcast=True)
         self._send(hello, broadcast=False)
 
@@ -105,8 +109,8 @@ class PeerDiscovery:
 
     def handle_message(self, msg: ChatMessage, via_bcast: bool) -> bool:
         """Process incoming discovery message. Returns True if peer list changed."""
-        if msg.from_ip == self.local_ip:
-            return False  # Ignore own messages
+        if msg.instance_id == self.instance_id:
+            return False  # Ignore own messages (by instance, allows same-host peers)
 
         with self._lock:
             if msg.type == MessageType.HELLO.value:
@@ -167,7 +171,9 @@ class PeerDiscovery:
         with self._lock:
             if ip in self._peers:
                 self._peers[ip].ignored = True
-                ignore_msg = ChatMessage.create_ignore(self.local_ip, self.local_name, ip, self._next_seq())
+                ignore_msg = ChatMessage.create_ignore(
+                    self.local_ip, self.local_name, ip, self._next_seq(),
+                    instance_id=self.instance_id)
                 self._send(ignore_msg, broadcast=True)
                 self._send(ignore_msg, broadcast=False)
                 return True
@@ -178,7 +184,9 @@ class PeerDiscovery:
         with self._lock:
             if ip in self._peers:
                 self._peers[ip].ignored = False
-                unignore_msg = ChatMessage.create_unignore(self.local_ip, self.local_name, ip, self._next_seq())
+                unignore_msg = ChatMessage.create_unignore(
+                    self.local_ip, self.local_name, ip, self._next_seq(),
+                    instance_id=self.instance_id)
                 self._send(unignore_msg, broadcast=True)
                 self._send(unignore_msg, broadcast=False)
                 return True

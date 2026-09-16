@@ -1,6 +1,7 @@
 """Parallel ICMP Ping with MSG_PEEK for multi-host ping."""
 
 import socket
+import struct
 import time
 import threading
 import select

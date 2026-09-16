@@ -5,6 +5,7 @@ import select
 import threading
 import time
 import sys
+import uuid
 from typing import Optional, Callable, List, Tuple
 from enum import Enum
 
@@ -34,6 +35,7 @@ class P2PChat:
         self.interface_name = interface_name
         self.interface_ip = interface_ip
         self.name = name
+        self.instance_id = uuid.uuid4().hex[:12]  # Unique per-process instance
 
         self.network = NetworkManager(port, multicast_group, interface_name, interface_ip)
         self.discovery: Optional[PeerDiscovery] = None
@@ -46,6 +48,9 @@ class P2PChat:
         self._seq = 0
         self._output_callback: Optional[Callable[[str], None]] = None
         self._lock = threading.Lock()
+        # Dedup: (instance_id, seq) seen recently (both sockets get same datagram)
+        self._seen: set = set()
+        self._seen_max = 1000
 
     def set_output_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for output messages (for CLI integration)."""
@@ -66,6 +71,7 @@ class P2PChat:
         self.discovery = PeerDiscovery(
             local_ip=local_ip,
             local_name=self.name,
+            instance_id=self.instance_id,
             hello_interval=5.0,
             peer_timeout=30.0,
             send_callback=self._send_discovery_message,
@@ -99,6 +105,7 @@ class P2PChat:
 
     def _send_discovery_message(self, msg: ChatMessage, broadcast: bool) -> None:
         """Callback for PeerDiscovery to send messages."""
+        msg.instance_id = self.instance_id
         self._send_message(msg, broadcast=broadcast)
 
     def _next_seq(self) -> int:
@@ -132,6 +139,7 @@ class P2PChat:
             self.name,
             text,
             self._next_seq(),
+            instance_id=self.instance_id,
         )
         if self._send_mode == SendMode.BROADCAST:
             self._send_message(msg, broadcast=True)
@@ -205,12 +213,22 @@ class P2PChat:
                     continue
 
                 sender_ip = addr[0]
-                if sender_ip == (self.network.interface.ip if self.network.interface else ""):
-                    continue
 
                 msg = parse_message(data, sender_ip)
                 if not msg:
                     continue
+
+                # Skip our own messages (by instance_id, not IP — allows same-host peers)
+                if msg.instance_id == self.instance_id:
+                    continue
+
+                # Dedup: same datagram is delivered to BOTH bcast and mcast sockets
+                key = (msg.instance_id, msg.seq)
+                if key in self._seen:
+                    continue
+                if len(self._seen) >= self._seen_max:
+                    self._seen.clear()
+                self._seen.add(key)
 
                 # Handle discovery messages
                 via_bcast = sock is bcast_sock

@@ -26,6 +26,7 @@ class ChatMessage:
 
     # Optional fields for specific types
     target_ip: Optional[str] = None  # For IGNORE/UNIGNORE
+    instance_id: Optional[str] = None  # Unique sender instance (for same-host filtering)
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -44,12 +45,14 @@ class ChatMessage:
                 timestamp=d.get("timestamp", time.time()),
                 seq=d.get("seq", 0),
                 target_ip=d.get("target_ip"),
+                instance_id=d.get("instance_id"),
             )
         except (json.JSONDecodeError, KeyError):
             return None
 
     @classmethod
-    def create_msg(cls, from_ip: str, from_name: str, text: str, seq: int) -> "ChatMessage":
+    def create_msg(cls, from_ip: str, from_name: str, text: str, seq: int,
+                   instance_id: Optional[str] = None) -> "ChatMessage":
         return cls(
             type=MessageType.MSG.value,
             from_ip=from_ip,
@@ -57,10 +60,12 @@ class ChatMessage:
             text=text,
             timestamp=time.time(),
             seq=seq,
+            instance_id=instance_id,
         )
 
     @classmethod
-    def create_hello(cls, from_ip: str, from_name: str, seq: int) -> "ChatMessage":
+    def create_hello(cls, from_ip: str, from_name: str, seq: int,
+                     instance_id: Optional[str] = None) -> "ChatMessage":
         return cls(
             type=MessageType.HELLO.value,
             from_ip=from_ip,
@@ -68,10 +73,12 @@ class ChatMessage:
             text="",
             timestamp=time.time(),
             seq=seq,
+            instance_id=instance_id,
         )
 
     @classmethod
-    def create_bye(cls, from_ip: str, from_name: str, seq: int) -> "ChatMessage":
+    def create_bye(cls, from_ip: str, from_name: str, seq: int,
+                   instance_id: Optional[str] = None) -> "ChatMessage":
         return cls(
             type=MessageType.BYE.value,
             from_ip=from_ip,
@@ -79,10 +86,12 @@ class ChatMessage:
             text="",
             timestamp=time.time(),
             seq=seq,
+            instance_id=instance_id,
         )
 
     @classmethod
-    def create_ignore(cls, from_ip: str, from_name: str, target_ip: str, seq: int) -> "ChatMessage":
+    def create_ignore(cls, from_ip: str, from_name: str, target_ip: str, seq: int,
+                      instance_id: Optional[str] = None) -> "ChatMessage":
         return cls(
             type=MessageType.IGNORE.value,
             from_ip=from_ip,
@@ -91,10 +100,12 @@ class ChatMessage:
             timestamp=time.time(),
             seq=seq,
             target_ip=target_ip,
+            instance_id=instance_id,
         )
 
     @classmethod
-    def create_unignore(cls, from_ip: str, from_name: str, target_ip: str, seq: int) -> "ChatMessage":
+    def create_unignore(cls, from_ip: str, from_name: str, target_ip: str, seq: int,
+                        instance_id: Optional[str] = None) -> "ChatMessage":
         return cls(
             type=MessageType.UNIGNORE.value,
             from_ip=from_ip,
@@ -103,6 +114,7 @@ class ChatMessage:
             timestamp=time.time(),
             seq=seq,
             target_ip=target_ip,
+            instance_id=instance_id,
         )
 
 
