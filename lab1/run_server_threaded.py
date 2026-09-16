@@ -2,7 +2,7 @@
 """Сервер на многопоточности — по потоку на каждого клиента."""
 
 import argparse
-from server.server_threaded import main
+from lab1.server.server_threaded import main
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="FTP Server (threaded)")

@@ -216,8 +216,8 @@ def main():
         description="Smurf Attack Demonstration (EDUCATIONAL ONLY)",
         epilog="WARNING: Only use in isolated test networks!"
     )
-    parser.add_argument("--victim", required=True, help="Victim IP (spoofed source)")
-    parser.add_argument("--broadcast", required=True, help="Broadcast IP (target network)")
+    parser.add_argument("--victim", help="Victim IP (spoofed source)")
+    parser.add_argument("--broadcast", help="Broadcast IP (target network)")
     parser.add_argument("-c", "--count", type=int, default=5, help="Number of packets")
     parser.add_argument("-i", "--interval", type=float, default=0.2, help="Interval between packets")
     parser.add_argument("-s", "--size", type=int, default=56, help="ICMP payload size")
@@ -228,6 +228,11 @@ def main():
     if args.wireshark_help:
         demo_with_wireshark_instructions()
         return
+
+    if not args.victim or not args.broadcast:
+        parser.print_help()
+        print("\nERROR: --victim and --broadcast are required (unless --wireshark-help)")
+        sys.exit(1)
 
     # Safety check
     if not _is_private_network(args.broadcast):

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from collections import deque
 
-from common.protocol import PacketType, UDP_PAYLOAD_SIZE, UDP_WINDOW_SIZE, UDP_TIMEOUT, UDP_RETRY_LIMIT
+from lab1.common.protocol import PacketType, UDP_PAYLOAD_SIZE, UDP_WINDOW_SIZE, UDP_TIMEOUT, UDP_RETRY_LIMIT
 
 
 class ConnectionLostError(Exception):

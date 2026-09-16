@@ -31,8 +31,8 @@ def main():
 
     # Smurf subcommand
     smurf_parser = subparsers.add_parser("smurf", help="Smurf attack demo (educational)")
-    smurf_parser.add_argument("--victim", required=True, help="Victim IP (spoofed source)")
-    smurf_parser.add_argument("--broadcast", required=True, help="Broadcast IP")
+    smurf_parser.add_argument("--victim", help="Victim IP (spoofed source)")
+    smurf_parser.add_argument("--broadcast", help="Broadcast IP")
     smurf_parser.add_argument("-c", "--count", type=int, default=5)
     smurf_parser.add_argument("-i", "--interval", type=float, default=0.2)
     smurf_parser.add_argument("-s", "--size", type=int, default=56)
@@ -54,10 +54,15 @@ def main():
         ]]
         trace_main()
     elif args.command == "smurf":
-        sys.argv = ["smurf"] + [str(x) for x in [
-            "--victim", args.victim, "--broadcast", args.broadcast,
-            "-c", args.count, "-i", args.interval, "-s", args.size
-        ] + (["--wireshark-help"] if args.wireshark_help else [])]
+        argv = ["smurf"]
+        if args.victim:
+            argv += ["--victim", args.victim]
+        if args.broadcast:
+            argv += ["--broadcast", args.broadcast]
+        argv += ["-c", str(args.count), "-i", str(args.interval), "-s", str(args.size)]
+        if args.wireshark_help:
+            argv += ["--wireshark-help"]
+        sys.argv = argv
         smurf_main()
     else:
         parser.print_help()

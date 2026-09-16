@@ -1,7 +1,15 @@
 """Group management for Lab 8: MPI_Comm_split with random group sizes."""
 
 import numpy as np
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except (ImportError, OSError, RuntimeError) as _mpi_err:
+    raise ImportError(
+        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        f'Ошибка: {_mpi_err}'
+    ) from _mpi_err
 from typing import List, Tuple
 from dataclasses import dataclass
 

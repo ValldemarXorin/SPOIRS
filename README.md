@@ -27,18 +27,27 @@ SPOIRS/
 
 ### Требования
 ```bash
-# Базовые
+# Базовые (ЛР1-6)
 pip install numpy psutil colorama
 
 # Для ЛР7-8 (MPI)
 # Linux:
-sudo apt-get install openmpi-bin libopenmpi-dev
+sudo apt-get install openmpi-bin libopenmpi-dev python3-dev
 pip install mpi4py
 
 # Windows:
 # 1. Установить MS-MPI с https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi
+#    (важно! без него mpi4py не работает — ошибка "Could not find module 'msmpi.dll'")
 # 2. pip install mpi4py
 ```
+
+### Установка всех зависимостей разом
+```bash
+pip install -r requirements.txt
+```
+
+> **Важно:** все команды запускаются **из корня проекта** (`D:\6sem\SPOIRS`).
+> Каждая папка `labX/` — Python-пакет, поэтому используются команды `python -m labX...`.
 
 ---
 

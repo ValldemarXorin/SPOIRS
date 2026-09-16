@@ -4,7 +4,15 @@ import numpy as np
 import time
 from contextlib import contextmanager
 from typing import Tuple, Optional, Dict, List
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except (ImportError, OSError, RuntimeError) as _mpi_err:
+    raise ImportError(
+        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        f'Ошибка: {_mpi_err}'
+    ) from _mpi_err
 
 
 def generate_matrices(n: int, dtype=np.float64, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
@@ -161,7 +169,3 @@ def compare_times_blocking_vs_collective(
             speedup = bt / ct if ct > 0 else 0
             print(f"{i:<8} {bt:<15.4f} {ct:<15.4f} {speedup:<10.2f}x")
         print("=" * 60)
-
-
-# For backward compatibility with Lab 7 style
-split_matrix_rows = lambda matrix, comm: (0, np.array([]), np.array([]))  # Placeholder

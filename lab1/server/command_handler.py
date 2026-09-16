@@ -1,16 +1,17 @@
 """Обработчики команд сервера."""
 
+import socket
 import struct
 import threading
 import time
 from datetime import datetime
 
-from common.protocol import (
+from lab1.common.protocol import (
     Command, CommandType, Response, PacketType, format_response
 )
-from common.socket_utils import send_all
-from server.file_manager import FileManager
-from common.rudp import RudpSocket, create_rudp_socket
+from lab1.common.socket_utils import send_all
+from lab1.server.file_manager import FileManager
+from lab1.common.rudp import RudpSocket, create_rudp_socket
 
 _HDR = struct.Struct("!IB")
 

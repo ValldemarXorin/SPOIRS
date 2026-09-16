@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Точка входа для запуска сервера с пулом процессов (вариант 12)."""
 
-from server.server import main
+from lab1.server.server import main
 
 
 def run():

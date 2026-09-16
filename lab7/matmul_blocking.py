@@ -6,7 +6,15 @@ Uses MPI_Send/Recv (via Scatter, Bcast, Gather collectives).
 import sys
 import argparse
 import numpy as np
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except (ImportError, OSError, RuntimeError) as _mpi_err:
+    raise ImportError(
+        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        f'Ошибка: {_mpi_err}'
+    ) from _mpi_err
 
 from lab7.utils import (
     generate_matrices,

@@ -9,11 +9,11 @@ import threading
 from pathlib import Path
 from typing import Optional, Callable
 
-from common.protocol import (
+from lab1.common.protocol import (
     COMMAND_TERMINATOR, BUFFER_SIZE, PacketType
 )
-from common.socket_utils import create_udp_socket
-from common.rudp import RudpSocket
+from lab1.common.socket_utils import create_udp_socket
+from lab1.common.rudp import RudpSocket
 
 _HDR = struct.Struct("!IB")
 

@@ -2,11 +2,11 @@
 """Клиент для подключения к threaded-серверу."""
 
 import argparse
-from client.client import InteractiveClient
+from lab1.client.client import InteractiveClient
 
 def main():
     p = argparse.ArgumentParser(description="FTP Client (for threaded server)")
-    p.add_argument('host')
+    p.add_argument('host', nargs='?', default='127.0.0.1')
     p.add_argument('--port', type=int, default=9000)
     a = p.parse_args()
     print("=== Client for THREADED server ===")

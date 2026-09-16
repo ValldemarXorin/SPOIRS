@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional, Dict, Tuple, Callable
 from dataclasses import dataclass, field
 
-from common.protocol import (
+from lab1.common.protocol import (
     CommandType,
     PacketType,
     parse_command,
@@ -18,8 +18,8 @@ from common.protocol import (
     COMMAND_TERMINATOR,
     Response,
 )
-from common.socket_utils import create_udp_socket
-from common.rudp import RudpSocket
+from lab1.common.socket_utils import create_udp_socket
+from lab1.common.rudp import RudpSocket
 from lab1.server.file_manager import FileManager
 
 _HDR = struct.Struct("!IB")

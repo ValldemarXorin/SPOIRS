@@ -9,7 +9,7 @@ import threading
 from datetime import datetime
 from typing import Optional, Dict, List
 
-from common.protocol import (
+from lab1.common.protocol import (
     CommandType,
     PacketType,
     parse_command,
@@ -19,10 +19,10 @@ from common.protocol import (
     Response,
     UDP_ACK_INTERVAL,
 )
-from common.socket_utils import create_server_socket, send_all, create_udp_socket
-from common.rudp import RUDPSocket, ConnectionLostError
-from server.command_handler import CommandHandler
-from server.file_manager import FileManager, TransferSession
+from lab1.common.socket_utils import create_server_socket, send_all, create_udp_socket
+from lab1.common.rudp import RudpSocket, ConnectionLostError
+from lab1.server.command_handler import CommandHandler
+from lab1.server.file_manager import FileManager, TransferSession
 
 TCP_CHUNK = 64 * 1024
 _HDR = struct.Struct("!IB")

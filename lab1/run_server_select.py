@@ -2,7 +2,7 @@
 """Сервер на мультиплексировании (select), без потоков и процессов."""
 
 import argparse
-from server.server_select import main
+from lab1.server.server_select import main
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="FTP Server (select multiplexing)")
