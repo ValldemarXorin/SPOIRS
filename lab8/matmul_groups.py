@@ -4,6 +4,7 @@ Lab 8: MPI Matrix Multiplication with Groups, Collective Operations, and MPI-IO.
 
 import sys
 import argparse
+import time
 import numpy as np
 try:
     from mpi4py import MPI
@@ -32,9 +33,10 @@ def matmul_collective(
     gcomm: MPI.Comm,
     A_local: np.ndarray,
     B: np.ndarray,
-) -> np.ndarray:
+) -> float:
     """
     Matrix multiplication using collective operations within group.
+    Returns elapsed time on group root.
     """
     rank = gcomm.Get_rank()
     size = gcomm.Get_size()
@@ -43,17 +45,19 @@ def matmul_collective(
     # Broadcast B to all (already done in read phase, but ensure)
     B = gcomm.bcast(B, root=0)
 
+    start = time.perf_counter()
+
     # Local computation
-    with timer(gcomm, f"Group {gcomm.Get_rank()} local matmul"):
+    with timer(gcomm, f"Group {rank} local matmul"):
         C_local = A_local @ B
 
     # Gather results using collective Gatherv
     local_rows = A_local.shape[0]
-    rows_per_proc = gcomm.allgather(local_rows)
+    rows_per_proc = np.array(gcomm.allgather(local_rows), dtype=int)
     displs = np.zeros(size, dtype=int)
     displs[1:] = np.cumsum(rows_per_proc)[:-1]
 
-    with timer(gcomm, f"Group {gcomm.Get_rank()} Gatherv"):
+    with timer(gcomm, f"Group {rank} Gatherv"):
         if rank == 0:
             C = np.empty((n, n), dtype=np.float64)
         else:
@@ -64,17 +68,19 @@ def matmul_collective(
             root=0
         )
 
-    return C if rank == 0 else None
+    elapsed = time.perf_counter() - start
+    return elapsed if rank == 0 else 0.0
 
 
 def matmul_blocking_pairwise(
     gcomm: MPI.Comm,
     A_local: np.ndarray,
     B: np.ndarray,
-) -> np.ndarray:
+) -> float:
     """
     Matrix multiplication using pairwise send/recv (blocking).
     Simulates the Lab 7 blocking approach within a group.
+    Returns elapsed time on group root.
     """
     rank = gcomm.Get_rank()
     size = gcomm.Get_size()
@@ -83,17 +89,19 @@ def matmul_blocking_pairwise(
     # Broadcast B
     B = gcomm.bcast(B, root=0)
 
+    start = time.perf_counter()
+
     # Local computation
-    with timer(gcomm, f"Group {gcomm.Get_rank()} local matmul (pairwise)"):
+    with timer(gcomm, f"Group {rank} local matmul (pairwise)"):
         C_local = A_local @ B
 
     # Gather using pairwise sends (root receives from all)
     local_rows = A_local.shape[0]
-    rows_per_proc = gcomm.allgather(local_rows)
+    rows_per_proc = np.array(gcomm.allgather(local_rows), dtype=int)
     displs = np.zeros(size, dtype=int)
     displs[1:] = np.cumsum(rows_per_proc)[:-1]
 
-    with timer(gcomm, f"Group {gcomm.Get_rank()} Gather (pairwise)"):
+    with timer(gcomm, f"Group {rank} Gather (pairwise)"):
         if rank == 0:
             C = np.empty((n, n), dtype=np.float64)
             # Receive from other ranks
@@ -102,16 +110,15 @@ def matmul_blocking_pairwise(
                     src_rows = rows_per_proc[src]
                     src_data = np.empty((src_rows, n), dtype=np.float64)
                     gcomm.Recv([src_data, MPI.DOUBLE], source=src, tag=100)
-                    displ = displs[src] * n
-                    C[displ:displ + src_rows * n].reshape(src_rows, n)[:] = src_data
+                    C[displs[src]:displs[src] + src_rows, :] = src_data
             # Copy own data
-            displ = displs[0] * n
-            C[displ:displ + local_rows * n].reshape(local_rows, n)[:] = C_local
+            C[displs[0]:displs[0] + local_rows, :] = C_local
         else:
             C = None
             gcomm.Send([C_local, MPI.DOUBLE], dest=0, tag=100)
 
-    return C if rank == 0 else None
+    elapsed = time.perf_counter() - start
+    return elapsed if rank == 0 else 0.0
 
 
 def run_group_multiplication(
@@ -134,25 +141,20 @@ def run_group_multiplication(
     filename_A = "matrix_A.bin"
     filename_B = "matrix_B.bin"
 
-    with timer(gcomm, f"Group {gcomm.Get_rank()} MPI-IO read"):
+    with timer(gcomm, f"Group {rank} MPI-IO read"):
         A_local, B = read_matrices_for_group(gcomm, filename_A, filename_B, n)
 
-    print_matrix_info(f"Group {gcomm.Get_rank()} A_local", A_local)
-    print_matrix_info(f"Group {gcomm.Get_rank()} B", B)
+    print_matrix_info(f"Group {rank} A_local", A_local)
+    print_matrix_info(f"Group {rank} B", B)
 
     # Run multiplication
+    elapsed = 0.0
     if use_collective:
         elapsed = matmul_collective(gcomm, A_local, B)
     else:
         elapsed = matmul_blocking_pairwise(gcomm, A_local, B)
 
-    # Verification on group root
-    if rank == 0 and elapsed is not None and verify:
-        with timer(gcomm, f"Group {gcomm.Get_rank()} verification"):
-            # We'd need full A and B for verification - skip for now
-            pass
-
-    return 0.0  # timer prints elapsed
+    return elapsed
 
 
 def main():

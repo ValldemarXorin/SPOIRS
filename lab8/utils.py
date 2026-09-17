@@ -95,7 +95,8 @@ def write_matrices_to_files(
 ) -> None:
     """
     Generate matrices on rank 0 and write to files using MPI-IO.
-    All processes participate in collective write.
+    A is written distributed (row-partitioned).
+    B is written as a full matrix (all processes need the full B).
     """
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -122,10 +123,15 @@ def write_matrices_to_files(
     # Broadcast B
     B = comm.bcast(B, root=0)
     
-    # Write to files using MPI-IO (collective)
+    # Write A (distributed, collective)
     from lab8.mpi_io import write_matrix_to_file
     write_matrix_to_file(comm, filename_A, A_local)
-    write_matrix_to_file(comm, filename_B, B)
+    
+    # Write B (full matrix, all processes must open collectively, only rank 0 writes)
+    fh = MPI.File.Open(comm, filename_B, MPI.MODE_CREATE | MPI.MODE_WRONLY)
+    if rank == 0:
+        fh.Write(B)
+    fh.Close()
 
 
 def read_matrices_for_group(

@@ -113,13 +113,16 @@ def create_random_groups(
 def print_group_info(groups: List[GroupInfo], comm: MPI.Comm) -> None:
     """Print group configuration on rank 0."""
     rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # Gather group assignments from all ranks using parent communicator
+    all_group_ids = comm.allgather(next((g.group_id for g in groups if g.is_member), -1))
+
     if rank == 0:
         print(f"[GROUP CONFIG] Total groups: {len(groups)}")
         for g in groups:
-            if g.is_member:
-                print(f"  Group {g.group_id}: {g.size} processes, ranks: {comm.allgather(rank) if g.comm != MPI.COMM_NULL else 'N/A'}")
-            else:
-                print(f"  Group {g.group_id}: {g.size} processes (not member)")
+            member_ranks = [r for r, gid in enumerate(all_group_ids) if gid == g.group_id]
+            print(f"  Group {g.group_id}: {len(member_ranks)} processes, ranks: {member_ranks}")
 
 
 def get_my_group(groups: List[GroupInfo]) -> GroupInfo:

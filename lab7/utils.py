@@ -23,18 +23,20 @@ def generate_matrices(n: int, dtype=np.float64, seed: int = 42) -> Tuple[np.ndar
     return A, B
 
 
-def split_matrix_rows(matrix: np.ndarray, comm: MPI.Comm) -> Tuple[np.ndarray, int, int]:
+def split_matrix_rows(total_rows: int, comm: MPI.Comm) -> Tuple[int, np.ndarray, np.ndarray]:
     """
     Split matrix rows across processes.
+    Args:
+        total_rows: total number of rows in the matrix (known to all processes)
+        comm: MPI communicator
     Returns: (local_rows, rows_per_proc, displs)
     """
     rank = comm.Get_rank()
     size = comm.Get_size()
-    n = matrix.shape[0]
 
     # Calculate rows per process (handle uneven division)
-    base_rows = n // size
-    remainder = n % size
+    base_rows = total_rows // size
+    remainder = total_rows % size
 
     rows_per_proc = np.full(size, base_rows, dtype=int)
     rows_per_proc[:remainder] += 1
@@ -42,7 +44,7 @@ def split_matrix_rows(matrix: np.ndarray, comm: MPI.Comm) -> Tuple[np.ndarray, i
     displs = np.zeros(size, dtype=int)
     displs[1:] = np.cumsum(rows_per_proc)[:-1]
 
-    local_rows = rows_per_proc[rank]
+    local_rows = int(rows_per_proc[rank])
     return local_rows, rows_per_proc, displs
 
 

@@ -52,7 +52,7 @@ def matmul_blocking(comm: MPI.Comm, n: int, verify: bool = False) -> float:
         B = comm.bcast(B, root=0)
 
     # Step 3: Scatter rows of A
-    local_rows, rows_per_proc, displs = split_matrix_rows(A if rank == 0 else np.empty((0, n)), comm)
+    local_rows, rows_per_proc, displs = split_matrix_rows(n, comm)
 
     with timer(comm, "Scatter A rows"):
         A_local = scatter_matrix_rows(comm, A, local_rows, n)

@@ -88,6 +88,23 @@ def read_matrix_from_file(
     return local_matrix
 
 
+def read_full_matrix(
+    comm: MPI.Comm,
+    filename: str,
+    n: int,
+    dtype: np.dtype = np.float64,
+) -> np.ndarray:
+    """
+    Read a full n×n matrix from file.
+    Each process reads the entire matrix independently.
+    """
+    matrix = np.empty((n, n), dtype=dtype)
+    fh = MPI.File.Open(comm, filename, MPI.MODE_RDONLY)
+    fh.Read_at(0, matrix)
+    fh.Close()
+    return matrix
+
+
 def generate_and_write_matrices(
     comm: MPI.Comm,
     filename_A: str,
@@ -186,11 +203,11 @@ def read_matrices_for_group(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Read matrix portions for a group communicator.
-    Each process in the group reads its portion.
+    A is read distributed (row-partitioned), B is read as a full matrix.
     """
     return (
         read_matrix_from_file(gcomm, filename_A, (n, n)),
-        read_matrix_from_file(gcomm, filename_B, (n, n)),
+        read_full_matrix(gcomm, filename_B, n),
     )
 
 

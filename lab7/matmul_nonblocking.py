@@ -52,12 +52,10 @@ def matmul_nonblocking(comm: MPI.Comm, n: int, verify: bool = False) -> float:
         print_matrix_info("B", B)
     else:
         A = None
-        B = None
+        B = np.empty((n, n), dtype=np.float64)
 
     # Step 2: Determine distribution
-    local_rows, rows_per_proc, displs = split_matrix_rows(
-        A if rank == 0 else np.empty((0, n)), comm
-    )
+    local_rows, rows_per_proc, displs = split_matrix_rows(n, comm)
 
     # Step 3: Non-blocking broadcast of B
     if has_nb_collectives:
