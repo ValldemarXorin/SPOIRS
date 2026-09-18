@@ -119,10 +119,21 @@ class ChatMessage:
 
 
 def parse_message(data: bytes, sender_ip: str) -> Optional[ChatMessage]:
-    """Parse incoming message, validate sender IP matches."""
+    """Parse incoming message.
+
+    ВАЖНО: не отбрасываем пакет из-за несовпадения from_ip и реального
+    адреса источника. На хостах с несколькими интерфейсами (Windows + WSL,
+    Hyper-V, VirtualBox, несколько сетевых карт) значение from_ip внутри
+    JSON часто не совпадает с адресом сокета recvfrom. Раньше это молча
+    "глотало" сообщения. Теперь мы доверяем реальному адресу источника
+    (sender_ip) и переписываем поле from_ip.
+    """
     try:
         msg = ChatMessage.from_json(data.decode("utf-8"))
-        if msg and msg.from_ip == sender_ip:
+        if msg:
+            # Доверяем адресу сокета, а не полю в полезной нагрузке
+            if not msg.from_ip:
+                msg.from_ip = sender_ip
             return msg
     except Exception:
         pass

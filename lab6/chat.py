@@ -5,6 +5,7 @@ import select
 import threading
 import time
 import sys
+import os
 import uuid
 from typing import Optional, Callable, List, Tuple
 from enum import Enum
@@ -48,9 +49,17 @@ class P2PChat:
         self._seq = 0
         self._output_callback: Optional[Callable[[str], None]] = None
         self._lock = threading.Lock()
-        # Dedup: (instance_id, seq) seen recently (both sockets get same datagram)
+        # Dedup: (instance_id, type, seq) seen recently (both sockets get same datagram)
+        # ВАЖНО: в ключ добавлен msg.type. Раньше ключ был (instance_id, seq), но
+        # чат (P2PChat._seq, старт с 0) и discovery (PeerDiscovery._seq, старт
+        # со случайного значения) — это ДВА независимых счётчика. Их номера
+        # пересекались, из-за чего чат-сообщение с seq=N молча гасилось как
+        # "дубликат" ранее пришедшего HELLO с тем же seq=N. Это и вызывало
+        # пропажу сообщений в одну сторону (Linux -> Windows / Windows -> Linux).
         self._seen: set = set()
         self._seen_max = 1000
+        # Диагностика: PCHAT_DEBUG=1 включает лог отброшенных пакетов
+        self._debug = os.environ.get("PCHAT_DEBUG", "") == "1"
 
     def set_output_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for output messages (for CLI integration)."""
@@ -61,6 +70,10 @@ class P2PChat:
             self._output_callback(msg)
         else:
             print(msg)
+
+    def _debug_log(self, msg: str) -> None:
+        if self._debug:
+            self._output(f"[DEBUG] {msg}")
 
     def start(self) -> bool:
         """Initialize network and start chat loops."""
@@ -119,18 +132,33 @@ class P2PChat:
         data = msg.to_json().encode("utf-8")
 
         if broadcast and bcast_sock:
+            # Шлём на directed broadcast интерфейса И на limited broadcast
+            # 255.255.255.255. Разные ОС по-разному относятся к directed
+            # broadcast: если маски на Windows и Linux не совпали, directed
+            # broadcast может не дойти. Limited broadcast — надёжный запасной
+            # канал внутри одной локальной сети.
+            addrs = []
             try:
-                bcast_addr = self.network.get_broadcast_addr()
-                bcast_sock.sendto(data, bcast_addr)
-            except OSError:
+                addrs.append(self.network.get_broadcast_addr())
+            except Exception:
                 pass
+            addrs.append(("255.255.255.255", self.port))
+            sent = set()
+            for addr in addrs:
+                if addr in sent:
+                    continue
+                sent.add(addr)
+                try:
+                    bcast_sock.sendto(data, addr)
+                except OSError as e:
+                    self._debug_log(f"send bcast to {addr} failed: {e}")
 
         if not broadcast and mcast_sock:
             try:
                 mcast_addr = self.network.get_multicast_addr()
                 mcast_sock.sendto(data, mcast_addr)
-            except OSError:
-                pass
+            except OSError as e:
+                self._debug_log(f"send mcast failed: {e}")
 
     def send_chat(self, text: str) -> None:
         """Send chat message."""
@@ -174,19 +202,19 @@ class P2PChat:
     def list_peers(self) -> List[str]:
         """Get formatted peer list."""
         if not self.discovery:
-            return ["Discovery not initialized"]
+            return ["Discovery not started"]
         peers = self.discovery.get_peers()
         if not peers:
-            return ["No peers found"]
-        lines = []
+            return ["No peers discovered yet"]
+        lines = [f"Peers ({len(peers)}):"]
         for p in peers:
             status = []
-            if p.via_bcast:
-                status.append("BCAST")
-            if p.via_mcast:
-                status.append("MCAST")
             if p.ignored:
-                status.append("IGNORED")
+                status.append("ignored")
+            if p.via_bcast:
+                status.append("bcast")
+            if p.via_mcast:
+                status.append("mcast")
             status_str = f" [{', '.join(status)}]" if status else ""
             last = time.time() - p.last_seen
             lines.append(f"  {p.ip:<15} {p.name:<15} {last:>5.0f}s ago{status_str}")
@@ -216,14 +244,17 @@ class P2PChat:
 
                 msg = parse_message(data, sender_ip)
                 if not msg:
+                    self._debug_log(f"parse failed from {sender_ip}: {data[:80]!r}")
                     continue
 
                 # Skip our own messages (by instance_id, not IP — allows same-host peers)
                 if msg.instance_id == self.instance_id:
                     continue
 
-                # Dedup: same datagram is delivered to BOTH bcast and mcast sockets
-                key = (msg.instance_id, msg.seq)
+                # Dedup: same datagram is delivered to BOTH bcast and mcast sockets,
+                # а теперь ещё и через directed + limited broadcast. Ключ включает
+                # msg.type, чтобы seq чата и seq discovery не пересекались.
+                key = (msg.instance_id, msg.type, msg.seq)
                 if key in self._seen:
                     continue
                 if len(self._seen) >= self._seen_max:
@@ -243,6 +274,7 @@ class P2PChat:
 
                 # Ignore check
                 if self.discovery and self.discovery.is_ignored(sender_ip):
+                    self._debug_log(f"dropped (ignored) msg from {sender_ip}")
                     continue
 
                 # Chat message
