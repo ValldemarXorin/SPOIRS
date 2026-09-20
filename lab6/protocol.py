@@ -13,6 +13,7 @@ class MessageType(Enum):
     BYE = "bye"           # Leaving
     IGNORE = "ignore"     # Force ignore a peer
     UNIGNORE = "unignore" # Remove from ignore list
+    ACK = "ack"           # Delivery confirmation (reliable delivery)
 
 
 @dataclass
@@ -27,6 +28,8 @@ class ChatMessage:
     # Optional fields for specific types
     target_ip: Optional[str] = None  # For IGNORE/UNIGNORE
     instance_id: Optional[str] = None  # Unique sender instance (for same-host filtering)
+    ack_seq: Optional[int] = None  # For ACK: seq of the confirmed message
+    ack_instance_id: Optional[str] = None  # For ACK: instance of the confirmed sender
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -46,6 +49,8 @@ class ChatMessage:
                 seq=d.get("seq", 0),
                 target_ip=d.get("target_ip"),
                 instance_id=d.get("instance_id"),
+                ack_seq=d.get("ack_seq"),
+                ack_instance_id=d.get("ack_instance_id"),
             )
         except (json.JSONDecodeError, KeyError):
             return None
@@ -115,6 +120,23 @@ class ChatMessage:
             seq=seq,
             target_ip=target_ip,
             instance_id=instance_id,
+        )
+
+    @classmethod
+    def create_ack(cls, from_ip: str, from_name: str, seq: int,
+                   ack_seq: int, ack_instance_id: str,
+                   instance_id: Optional[str] = None) -> "ChatMessage":
+        """Delivery confirmation for the message (ack_instance_id, ack_seq)."""
+        return cls(
+            type=MessageType.ACK.value,
+            from_ip=from_ip,
+            from_name=from_name,
+            text="",
+            timestamp=time.time(),
+            seq=seq,
+            instance_id=instance_id,
+            ack_seq=ack_seq,
+            ack_instance_id=ack_instance_id,
         )
 
 

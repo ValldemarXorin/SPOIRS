@@ -75,6 +75,10 @@ class ChatCLI:
         self._output("  /bcast          - Switch to broadcast mode")
         self._output("  /mcast          - Switch to multicast mode")
         self._output("  /mode           - Show current mode")
+        self._output("  /reliable       - Toggle ACK-based resend buffer")
+        self._output("  /slow           - Toggle low-throughput fallback (patient RTO)")
+        self._output("  /buffer         - Show messages awaiting delivery ACKs")
+        self._output("  /rto            - Show RTO / reliability statistics")
         self._output("  /interfaces     - Show available network interfaces")
         self._output("  /quit           - Exit chat")
         self._output("============================")
@@ -127,6 +131,28 @@ class ChatCLI:
         elif cmd == "/mode":
             self._output(f"Current mode: {self.chat._send_mode.value.upper()}")
 
+        elif cmd == "/reliable":
+            # /reliable        → toggle
+            # /reliable on|off → explicit
+            if len(parts) > 1:
+                self.chat.set_reliable(parts[1].lower() in ("on", "1", "true", "yes"))
+            else:
+                self.chat.set_reliable(not self.chat._reliable_enabled)
+
+        elif cmd == "/slow":
+            if len(parts) > 1:
+                self.chat.set_low_throughput(parts[1].lower() in ("on", "1", "true", "yes"))
+            else:
+                self.chat.set_low_throughput(not self.chat._low_throughput)
+
+        elif cmd == "/buffer":
+            for line in self.chat.buffer_info():
+                self._output(line)
+
+        elif cmd == "/rto":
+            for line in self.chat.rto_info():
+                self._output(line)
+
         elif cmd == "/interfaces":
             self._show_interfaces()
 
@@ -160,6 +186,18 @@ def main():
     parser.add_argument("-i", "--interface", help="Interface name")
     parser.add_argument("--ip", help="Interface IP")
     parser.add_argument("-n", "--name", default="Anonymous", help="Display name")
+    parser.add_argument("--reliable", dest="reliable", action="store_true", default=True,
+                        help="Enable ACK-based reliable delivery (default)")
+    parser.add_argument("--no-reliable", dest="reliable", action="store_false",
+                        help="Disable reliable delivery (best-effort)")
+    parser.add_argument("--slow", dest="low_throughput", action="store_true",
+                        help="Low-throughput network fallback: patient RTOs, more retries")
+    parser.add_argument("--rto", type=float, default=None,
+                        help="Initial retransmission timeout in seconds")
+    parser.add_argument("--max-retries", type=int, default=None,
+                        help="Max resends before a message is dropped")
+    parser.add_argument("--backoff", type=float, default=None,
+                        help="RTO backoff multiplier per retry (default 2.0)")
     args = parser.parse_args()
 
     chat = P2PChat(
@@ -168,6 +206,11 @@ def main():
         interface_name=args.interface,
         interface_ip=args.ip,
         name=args.name,
+        reliable=args.reliable,
+        low_throughput=args.low_throughput,
+        initial_rto=args.rto,
+        max_retries=args.max_retries,
+        backoff_factor=args.backoff,
     )
 
     cli = ChatCLI(chat)

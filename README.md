@@ -149,22 +149,25 @@ sudo python -m lab5 smurf --victim 192.168.1.10 --broadcast 192.168.1.255
 
 ### [ЛР6](./lab6/) — P2P чат: Broadcast + Multicast
 **Требование:** P2P чат, автоопределение IP/маски/broadcast, discovery, ignore list.
+**Бонус:** надёжная доставка — буфер отправки с ACK-подтверждениями, ретрансляцией
+и адаптивным RTO; fallback `--slow` для низкоскоростных сетей.
 
 | Файл | Описание |
 |------|----------|
 | `network.py` | Автоопределение интерфейсов (psutil/socket), broadcast = IP \| ~mask |
-| `protocol.py` | JSON сообщения: msg, hello, bye, ignore, unignore |
+| `protocol.py` | JSON сообщения: msg, hello, bye, ignore, unignore, ack |
 | `discovery.py` | `PeerDiscovery` — HELLO каждые 5с, TTL 30с, force-ignore |
-| `chat.py` | `P2PChat` — recv_loop (select на 2 сокетах) + send_loop |
-| `cli.py` | Команды: `/name`, `/list`, `/ignore`, `/bcast`, `/mcast`, `/quit` |
+| `chat.py` | `P2PChat` — recv_loop (select на 2 сокетах) + send_loop + reliability buffer |
+| `cli.py` | Команды: `/name`, `/list`, `/ignore`, `/bcast`, `/mcast`, `/reliable`, `/slow`, `/buffer`, `/rto`, `/quit` |
 | `ANSWERS.md` | Ответы на 5 вопросов защиты |
 
 **Команды чата:**
 ```
 /help           /name <имя>    /list
 /ignore <ip>    /unignore <ip> /bcast
-/mcast          /mode          /interfaces
-/quit
+/mcast          /mode          /reliable
+/slow           /buffer        /rto
+/interfaces     /quit
 ```
 
 **Запуск:**
@@ -174,6 +177,9 @@ python -m lab6 -n "Alice"
 
 # Терминал 2
 python -m lab6 -n "Bob"
+
+# Fallback для низкоскоростной сети (RTO 5..120с, 12 попыток)
+python -m lab6 -n "Alice" --slow
 
 # Тестирование ignore
 # В Alice: /ignore 192.168.1.5  (IP Боба)
@@ -289,6 +295,9 @@ mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4
 | Multicast join/leave | `/mcast` → `/leave` → `/join` |
 | Ignore list | `/ignore <ip>` — сообщения исчезают, `/unignore` — возвращаются |
 | Force-ignore | Один клиент шлёт IGNORE → другой добавляет в свой ignore list |
+| Релиабельный буфер | `/buffer` — сообщение в буфере → приходит ACK → буфер пустеет; `/rto` — статистика RTO/SRTT |
+| Ретрансляция | Отключить сеть у получателя → сообщение ретраейтся с backoff (см. лог `[reliable] ... resending`), при восстановлении — доставляется |
+| Fallback для медленной сети | `python -m lab6 --slow` (RTO 5..120с) — сообщение не «сдаётся» на медленном канале |
 | ANSWERS.md | Ответы на 5 вопросов (отличие bcast/mcast, формирование broadcast, диапазоны multicast, ограничения, область broadcast) |
 
 ### ЛР7 (MPI Matrix)
