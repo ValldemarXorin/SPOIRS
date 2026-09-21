@@ -180,7 +180,9 @@ class P2PChat:
 
         recipients = []
         if self.discovery:
-            recipients = [p.ip for p in self.discovery.get_peers()]
+            # Only peers that support ACKs go into the buffer; legacy (lr6.py)
+            # peers already got the message via the broadcast above.
+            recipients = [p.ip for p in self.discovery.get_peers() if p.reliable]
         if not recipients:
             return
 
@@ -329,16 +331,19 @@ class P2PChat:
             # have independent seq counters — otherwise the first PING (seq=1)
             # and the first TEXT (seq=1) would collide and the TEXT would be
             # silently dropped as a "duplicate".
-            key = (msg.instance_id, msg.type, msg.seq)
-            if key in self._seen:
-                # Duplicate of a chat message -> re-ACK so the sender
-                # stops retransmitting (its first ACK may have been lost).
-                if msg.type == MessageType.TEXT.value:
-                    self._send_ack(msg)
-                continue
-            if len(self._seen) >= self._seen_max:
-                self._seen.clear()
-            self._seen.add(key)
+            # Legacy peers (lr6.py) send no instance_id and never retransmit,
+            # so there is nothing to dedup for them.
+            if msg.instance_id is not None:
+                key = (msg.instance_id, msg.type, msg.seq)
+                if key in self._seen:
+                    # Duplicate of a chat message -> re-ACK so the sender
+                    # stops retransmitting (its first ACK may have been lost).
+                    if msg.type == MessageType.TEXT.value:
+                        self._send_ack(msg)
+                    continue
+                if len(self._seen) >= self._seen_max:
+                    self._seen.clear()
+                self._seen.add(key)
 
             # Discovery beacon
             if msg.type == MessageType.PING.value:
@@ -428,7 +433,13 @@ class P2PChat:
             for key in to_remove:
                 self._pending.pop(key, None)
             for pm in resend:
-                self._raw_send(pm.msg, pm.mode)
+                # Retransmit directly to the missing (reliable) peers via unicast —
+                # not broadcast, so legacy peers (lr6.py) don't receive duplicates
+                # and already-ACKed peers aren't hit again.
+                missing = [ip for ip in pm.recipients if ip not in pm.acked_by]
+                data = pm.msg.to_json().encode("utf-8")
+                for ip in missing:
+                    self.network.send_unicast(data, ip)
                 if pm.retries == 1:
                     self._output(
                         f"[reliable] msg #{pm.msg.seq} not confirmed, resending "

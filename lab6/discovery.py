@@ -13,6 +13,7 @@ class PeerInfo:
     ip: str
     name: str
     last_seen: float = field(default_factory=time.time)
+    reliable: bool = True  # False for lr6.py peers (no ACK / instance_id)
 
     def is_expired(self, timeout: float = 10.0) -> bool:
         return time.time() - self.last_seen > timeout
@@ -94,8 +95,17 @@ class PeerDiscovery:
         """Register or refresh a peer from a PING beacon."""
         if msg.instance_id == self.instance_id:
             return  # Ignore own messages (allows same-host peers)
+        # Peers that don't send instance_id are legacy (lr6.py) — they cannot ACK,
+        # so messages to them are best-effort only.
+        reliable = msg.instance_id is not None
         with self._lock:
-            self._peers[msg.from_ip] = PeerInfo(ip=msg.from_ip, name=msg.from_name, last_seen=time.time())
+            peer = self._peers.get(msg.from_ip)
+            if peer:
+                peer.name = msg.from_name
+                peer.last_seen = time.time()
+                peer.reliable = reliable
+            else:
+                self._peers[msg.from_ip] = PeerInfo(ip=msg.from_ip, name=msg.from_name, reliable=reliable)
 
     def get_peers(self) -> List[PeerInfo]:
         with self._lock:

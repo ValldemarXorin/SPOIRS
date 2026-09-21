@@ -2,15 +2,15 @@
 
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
 
 
 class MessageType(Enum):
-    PING = "ping"  # heartbeat / auto-discovery
-    TEXT = "text"  # chat message
-    ACK = "ack"    # delivery confirmation (reliable delivery)
+    PING = "PING"  # heartbeat / auto-discovery
+    TEXT = "TEXT"  # chat message
+    ACK = "ACK"    # delivery confirmation (reliable delivery, lab6 <-> lab6)
 
 
 @dataclass
@@ -28,8 +28,27 @@ class ChatMessage:
     ack_instance_id: Optional[str] = None  # For ACK: instance of the confirmed sender
 
     def to_json(self) -> str:
-        d = asdict(self)
-        return json.dumps({k: v for k, v in d.items() if v is not None}, separators=(",", ":"))
+        """lr6.py-compatible wire format, extended with reliability fields.
+
+        lr6.py reads only type/sender/ip/content; the rest is ignored by it.
+        """
+        d = {
+            "type": self.type,
+            "sender": self.from_name,
+            "ip": self.from_ip,
+            "content": self.content,
+            "from_ip": self.from_ip,
+            "from_name": self.from_name,
+            "timestamp": self.timestamp,
+            "seq": self.seq,
+        }
+        if self.instance_id is not None:
+            d["instance_id"] = self.instance_id
+        if self.ack_seq is not None:
+            d["ack_seq"] = self.ack_seq
+        if self.ack_instance_id is not None:
+            d["ack_instance_id"] = self.ack_instance_id
+        return json.dumps(d, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, data: str) -> Optional["ChatMessage"]:
@@ -37,8 +56,8 @@ class ChatMessage:
             d = json.loads(data)
             return cls(
                 type=d.get("type", ""),
-                from_ip=d.get("from_ip", ""),
-                from_name=d.get("from_name", ""),
+                from_ip=d.get("from_ip") or d.get("ip", ""),
+                from_name=d.get("from_name") or d.get("sender", ""),
                 content=d.get("content", ""),
                 timestamp=d.get("timestamp", time.time()),
                 seq=d.get("seq", 0),
