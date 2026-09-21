@@ -1,19 +1,16 @@
-# MPI Hosts File Example
+# MPI Hosts File
 # Format: hostname slots=count
-# One line per node
+# One line per node, '#' — комментарий.
 
-# Local testing (1 machine, 4 cores):
+# Локальный запуск (1 машина, 4 слота):
 localhost slots=4
 
-# Cluster example (3 nodes, 4 cores each):
+# Кластер (3 узла по 4 слота) — раскомментируйте и подставьте свои имена:
 # node1 slots=4
 # node2 slots=4
 # node3 slots=4
 
-# With specific IPs:
+# С конкретными IP:
 # 192.168.1.10 slots=4
 # 192.168.1.11 slots=4
 # 192.168.1.12 slots=4
-
-# Usage:
-# mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 4000

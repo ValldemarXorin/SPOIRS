@@ -1,18 +1,16 @@
-# MPI Hosts File for Lab 8
+# MPI Hosts File
 # Format: hostname slots=count
+# One line per node, '#' — комментарий.
 
-# Local testing (1 machine, 8 cores):
+# Локальный запуск (1 машина, 8 слотов):
 localhost slots=8
 
-# Cluster example (3 nodes, 8 cores each):
+# Кластер (3 узла по 8 слотов) — раскомментируйте и подставьте свои имена:
 # node1 slots=8
 # node2 slots=8
 # node3 slots=8
 
-# With specific IPs:
+# С конкретными IP:
 # 192.168.1.10 slots=8
 # 192.168.1.11 slots=8
 # 192.168.1.12 slots=8
-
-# Usage:
-# mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4

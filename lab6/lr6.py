@@ -258,6 +258,13 @@ class P2PChat:
 
         data = self.build_packet(message_type, text, target_ip)
         try:
+            # TEXT шлём юникастом каждому известному пиру: broadcast в Wi-Fi
+            # не имеет L2-ACK/ретрансмиссии и на загруженной точке доступа
+            # теряется, а юникаст ретранслируется драйвером.
+            if message_type == "TEXT" and self.active_peers:
+                for peer_ip in list(self.active_peers):
+                    self.send_sock.sendto(data, (peer_ip, self.port))
+                return True
             if force_broadcast or self.mode == "BROADCAST":
                 destination = (self.broadcast_ip, self.port)
             else:

@@ -66,6 +66,14 @@ class P2PChat:
             "content": content
         }).encode("utf-8")
 
+        # Текстовые сообщения шлём юникастом каждому известному пиру:
+        # broadcast в Wi-Fi не имеет L2-ACK/ретрансмиссии и на загруженной
+        # точке доступа теряется, а юникаст ретранслируется драйвером.
+        if msg_type == "TEXT" and self.active_peers:
+            for peer_ip in list(self.active_peers):
+                self.send_sock.sendto(data, (peer_ip, self.port))
+            return
+
         if self.mode == "BROADCAST":
             self.send_sock.sendto(data, (self.broadcast_ip, self.port))
         elif self.mode == "MULTICAST" and self.in_multicast_group:
