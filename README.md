@@ -154,20 +154,20 @@ sudo python -m lab5 smurf --victim 192.168.1.10 --broadcast 192.168.1.255
 
 | Файл | Описание |
 |------|----------|
-| `network.py` | Автоопределение интерфейсов (psutil/socket), broadcast = IP \| ~mask |
-| `protocol.py` | JSON сообщения: msg, hello, bye, ignore, unignore, ack |
-| `discovery.py` | `PeerDiscovery` — HELLO каждые 5с, TTL 30с, force-ignore |
-| `chat.py` | `P2PChat` — recv_loop (select на 2 сокетах) + send_loop + reliability buffer |
-| `cli.py` | Команды: `/name`, `/list`, `/ignore`, `/bcast`, `/mcast`, `/reliable`, `/slow`, `/buffer`, `/rto`, `/quit` |
+| `network.py` | Автоопределение IP через маршрут по умолчанию, broadcast = IP \| ~mask + спец-случай хотспота 172.20.10.x (/28) |
+| `protocol.py` | JSON сообщения: ping, text, ack |
+| `discovery.py` | `PeerDiscovery` — PING каждые 2.5с, TTL 10с |
+| `chat.py` | `P2PChat` — 1 recv-сокет (bcast+mcast) + reliability buffer (всегда включён) |
+| `cli.py` | Команды: `/name`, `/peers`, `/mode b\|m`, `/join`, `/leave`, `/ignore`, `/slow`, `/buffer`, `/rto`, `/quit` |
 | `ANSWERS.md` | Ответы на 5 вопросов защиты |
 
 **Команды чата:**
 ```
-/help           /name <имя>    /list
-/ignore <ip>    /unignore <ip> /bcast
-/mcast          /mode          /reliable
-/slow           /buffer        /rto
-/interfaces     /quit
+/help           /name <имя>    /peers
+/ignore <ip>    /unignore <ip> /mode b|m
+/join           /leave         /slow
+/buffer         /rto           /net
+/quit
 ```
 
 **Запуск:**
@@ -291,10 +291,9 @@ mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4
 ### ЛР6 (P2P Chat)
 | Что тестировать | Как показать |
 |----------------|--------------|
-| Broadcast discovery | 2 терминала → оба видят друг друга через HELLO |
-| Multicast join/leave | `/mcast` → `/leave` → `/join` |
+| Broadcast discovery | 2 терминала → оба видят друг друга через PING (~2.5с) |
+| Multicast join/leave | `/mode m` → `/join` → `/leave` |
 | Ignore list | `/ignore <ip>` — сообщения исчезают, `/unignore` — возвращаются |
-| Force-ignore | Один клиент шлёт IGNORE → другой добавляет в свой ignore list |
 | Релиабельный буфер | `/buffer` — сообщение в буфере → приходит ACK → буфер пустеет; `/rto` — статистика RTO/SRTT |
 | Ретрансляция | Отключить сеть у получателя → сообщение ретраейтся с backoff (см. лог `[reliable] ... resending`), при восстановлении — доставляется |
 | Fallback для медленной сети | `python -m lab6 --slow` (RTO 5..120с) — сообщение не «сдаётся» на медленном канале |

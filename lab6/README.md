@@ -4,41 +4,38 @@
 
 ## Возможности
 - **Broadcast режим** — обнаружение участников в локальном сегменте (L2)
-- **Multicast режим** — эффективная доставка сообщений группе (группа 239.255.0.1, Admin Scope)
-- **Автоопределение сети** — IP, маска, broadcast адрес интерфейса
-- **Peer Discovery** — периодические HELLO сообщения, автоматическое добавление/удаление участников
-- **Ignore список** — локальное игнорирование + принудительное игнорирование через IGNORE пакеты
-- **Надёжная доставка (буфер + ретрансляция)** — ACK-подтверждения, адаптивный RTO (Jacobson/Karels), экспоненциальный backoff
+- **Multicast режим** — доставка сообщений группе (группа 239.255.0.1, Admin Scope)
+- **Автоопределение сети** — IP берётся с интерфейса маршрута по умолчанию, broadcast считается по маске
+- **Поддержка хотспотов телефона** — для сети `172.20.10.x` (iPhone, маска /28) broadcast считается корректно (`172.20.10.15`), иначе через хотспот ничего не приходит
+- **Peer Discovery** — периодические PING-маяки (2.5с), автоматическое добавление/удаление участников (TTL 10с)
+- **Ignore список** — локальный чёрный список по IP
+- **Надёжная доставка (всегда включена)** — ACK-подтверждения, адаптивный RTO (Jacobson/Karels), экспоненциальный backoff
 - **Fallback для низкоскоростных сетей** — `/slow` или `--slow`: «терпеливый» RTO и больше попыток, чтобы не давить медленный канал
 - **CLI интерфейс** — команды для управления
 
 ## Запуск
 
 ```bash
-# Базовый запуск
+# Базовый запуск (спросит никнейм)
 python -m lab6
 
 # С указанием имени
 python -m lab6 -n "Alice"
 
 # С указанием порта и multicast группы
-python -m lab6 -p 50000 -g 239.255.0.1
-
-# Принудительный выбор интерфейса
-python -m lab6 -i "Ethernet0" --ip 192.168.1.5
-
-# Надёжная доставка: свои параметры RTO
-python -m lab6 -n "Alice" --rto 1.0 --max-retries 5 --backoff 2.0
+python -m lab6 -p 50050 -g 239.255.0.1
 
 # Fallback для низкоскоростной сети (RTO 5..120с, 12 попыток)
 python -m lab6 -n "Alice" --slow
 
-# Отключить надёжность (best-effort, как раньше)
-python -m lab6 -n "Alice" --no-reliable
+# Свои параметры RTO
+python -m lab6 -n "Alice" --rto 1.0 --max-retries 5 --backoff 2.0
 
 # Справка
 python -m lab6 --help
 ```
+
+По умолчанию используется порт `50050` и группа `239.255.0.1`.
 
 ## Команды чата
 
@@ -46,22 +43,29 @@ python -m lab6 --help
 |---------|----------|
 | `/help` | Показать справку |
 | `/name <имя>` | Установить отображаемое имя |
-| `/list` | Список участников (IP, имя, статус) |
-| `/ignore <ip>` | Игнорировать участника (шлёт IGNORE всем) |
-| `/unignore <ip>` | Перестать игнорировать |
-| `/bcast` | Переключиться в broadcast режим отправки |
-| `/mcast` | Переключиться в multicast режим отправки |
-| `/mode` | Показать текущий режим |
-| `/reliable` | Вкл/выкл ACK-подтверждения и буфер ретрансляции (`/reliable on\|off`) |
+| `/peers` | Список активных участников |
+| `/mode b\|m` | Переключить режим отправки: broadcast / multicast |
+| `/join` | Войти в multicast группу |
+| `/leave` | Выйти из multicast группы |
+| `/ignore <ip>` | Добавить хост в чёрный список |
+| `/unignore <ip>` | Убрать хост из чёрного списка |
 | `/slow` | Fallback для низкоскоростной сети (`/slow on\|off`) |
 | `/buffer` | Показать сообщения, ожидающие ACK (буфер отправки) |
 | `/rto` | Показать статистику RTO/SRTT |
-| `/interfaces` | Показать доступные сетевые интерфейсы |
+| `/net` | Показать локальный IP / broadcast / multicast |
 | `/quit` | Выйти из чата |
 
 Обычный текст отправляется как сообщение в чат.
 
-## Надёжная доставка (буфер + ретрансляция)
+## Логика работы (как в эталонном варианте)
+
+- **Локальный IP** определяется через `connect(("8.8.8.8", 80))` — берётся интерфейс, через который идёт маршрут по умолчанию (не «первый попавшийся»).
+- **Broadcast** считается по маске; для мобильных хотспотов `172.20.10.x` используется маска `/28`, поэтому broadcast = `172.20.10.15` (а не `172.20.10.255`). Без этого через хотспот телефона пакеты уходят не туда.
+- **Один recv-сокет** привязан к `("", port)` (`SO_REUSEADDR` + `SO_REUSEPORT` на Linux) и вступает в multicast группу — он принимает и broadcast, и multicast датаграммы.
+- **Отдельный send-сокет** с `SO_BROADCAST` и `IP_MULTICAST_TTL=2` шлёт в текущем режиме (`BROADCAST`/`MULTICAST`).
+- **Discovery**: каждый участник каждые 2.5с шлёт `ping`; пир считается активным 10с без пинга, затем удаляется.
+
+## Надёжная доставка (буфер + ретрансляция, всегда включена)
 
 UDP не гарантирует доставку, поэтому каждое **чат-сообщение**:
 
@@ -99,58 +103,59 @@ UDP не гарантирует доставку, поэтому каждое **
 │                   P2PChat                       │
 ├─────────────┬───────────────────┬───────────────┤
 │  Network    │   Discovery       │    CLI        │
-│  ────────   │   ───────────     │   ───         │
-│  • Bcast    │   • HELLO/5s      │   • Input     │
-│  • Mcast    │   • Peer registry │   • Output    │
-│  • Auto IP  │   • Ignore list   │   • Commands  │
-│  • Sockets  │   • TTL 30s       │   • Colors    │
+│  ────────   │   ───────────     │   ───────────  │
+│  • 1 recv   │   • PING / 2.5s   │   • Input     │
+│  • 1 send   │   • Peer registry │   • Output    │
+│  • Auto IP  │   • TTL 10s       │   • Commands  │
+│  • Hotspot  │   • Ignore list   │   • Colors    │
+│  • Multicast│                   │               │
 └─────────────┴───────────────────┴───────────────┘
 ```
 
 ### Сетевой слой (`network.py`)
-- `get_interfaces()` — автоопределение через `psutil` (fallback: socket)
-- `create_broadcast_socket()` — UDP + `SO_BROADCAST=1`
-- `create_multicast_socket()` — UDP + `IP_ADD_MEMBERSHIP` + `IP_MULTICAST_TTL=2`
+- `get_local_ip()` — IP интерфейса маршрута по умолчанию (через `connect`)
+- `calc_broadcast(ip)` — broadcast по маске, спец-случай хотспота `172.20.10.x` (/28)
+- `create_recv_socket()` — один приёмный сокет (`SO_REUSEADDR` + `SO_REUSEPORT`), вступает в multicast
+- `create_send_socket()` — отдельный сокет для broadcast/multicast/unicast отправок
 - `NetworkManager` — высокоуровневая обёртка
 
 ### Обнаружение (`discovery.py`)
-- `PeerDiscovery` — фоновые потоки: HELLO sender (5s) + cleanup (5s)
-- Реестр пиров: `{ip: PeerInfo(name, last_seen, ignored, via_bcast, via_mcast)}`
-- Обработка: HELLO, BYE, IGNORE, UNIGNORE
-- TTL 30 секунд без HELLO → удаление
+- `PeerDiscovery` — фоновые потоки: PING sender (2.5s) + cleanup (5s)
+- Реестр пиров: `{ip: PeerInfo(name, last_seen)}`
+- TTL 10 секунд без PING → удаление
 
 ### Протокол (`protocol.py`)
 ```json
 {
-  "type": "msg|hello|bye|ignore|unignore|ack",
+  "type": "ping|text|ack",
   "from_ip": "192.168.1.5",
   "from_name": "Alice",
-  "text": "Hello!",
+  "content": "Hello!",
   "timestamp": 1699999999.123,
   "seq": 42,
-  "target_ip": "192.168.1.10",      // для ignore/unignore
+  "instance_id": "abc",             // уникальный экземпляр отправителя
   "ack_seq": 42,                    // для ack: seq подтверждаемого сообщения
   "ack_instance_id": "abc"          // для ack: instance подтверждаемого отправителя
 }
 ```
 
 ### Чат (`chat.py`)
-- `P2PChat` — recv_loop (select на 2 сокетах) + send_loop
+- `P2PChat` — `_recv_loop` (один сокет, broadcast + multicast) + `_reliability_loop`
 - Режимы: `SendMode.BROADCAST` / `SendMode.MULTICAST`
-- Фильтр ignore-листа при получении
+- Фильтр ignore-листа при приёме
+- Дедупликация по `(instance_id, type, seq)` (тип в ключе, т.к. у PING и TEXT независимые счётчики seq)
 - **Надёжная доставка**: `_pending` буфер (`PendingMessage`), `_reliability_loop` (ретрансляция + backoff), `_update_rto` (Jacobson/Karels), `_handle_ack`
 
 ## Требования
 
 - Python 3.8+
-- `psutil` (опционально, для автоопределения интерфейсов) — `pip install psutil`
 - `colorama` (опционально, для цветного вывода) — `pip install colorama`
 
-На Windows/Linux работает без дополнительных зависимостей (использует socket fallback).
+Работает на Windows и Linux без дополнительных зависимостей.
 
 ## Тестирование
 
-Запустите два экземпляра в разных терминалах:
+Запустите два экземпляра (в разных терминалах или на разных машинах в одной сети):
 
 ```bash
 # Терминал 1
@@ -160,15 +165,21 @@ python -m lab6 -n "Alice"
 python -m lab6 -n "Bob"
 ```
 
-Оба увидят друг друга через HELLO. Попробуйте:
-- Написать сообщения
-- `/list` — список участников
+Оба увидят друг друга через PING-маяки (~2.5с). Попробуйте:
+- Написать сообщения (буфер/ACK в действии: `/buffer`, `/rto`)
+- `/peers` — список участников
+- `/mode m` — переключиться на multicast, `/join` / `/leave`
 - `/ignore <ip_bob>` — Алиса игнорирует Боба
-- `/bcast` / `/mcast` — смена режима
-- `/buffer` — посмотреть буфер сообщений, ожидающих ACK
-- `/rto` — статистика RTO/SRTT
-- `/slow` — включить fallback для медленной сети
+- `/slow` — включить fallback для медленной сети (хотспот телефона)
 - `/quit` — выход
+
+**Если работает через роутер, но не через хотспот телефона:** на Windows проверьте, что сеть определена как «Частная», и добавьте правило файрвола для входящего UDP на порт 50050:
+
+```powershell
+netsh advfirewall firewall add rule name="P2P Chat UDP 50050" dir=in action=allow protocol=UDP localport=50050
+```
+
+Также в настройках хотспота телефона отключите «изоляцию клиентов» (AP isolation), если она есть.
 
 ## Ответы на вопросы защиты
 
