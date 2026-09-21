@@ -1,7 +1,7 @@
-# Lab 7: MPI Matrix Multiplication
+# Lab 7: MPI Matrix Multiplication (Blocking / Non-Blocking)
 
-Программа для умножения матриц с использованием MPI (mpi4py).
-Реализованы два варианта: блокирующий и неблокирующий (перекрытие коммуникации и вычислений).
+Логика из эталонного `lr7.py`: честный блокирующий режим и настоящий неблокирующий конвейер
+(overlap: коммуникация перекрывается вычислениями, double buffering + prefetch).
 
 ## Требования
 - Python 3.8+
@@ -24,22 +24,16 @@ pip install mpi4py numpy
 
 ## Запуск
 
-### Локально (на 1 машине, 4 процесса):
+### Локально (на 1 машине, 3+ процесса — обязательно):
 ```bash
 # Блокирующий вариант
-mpirun -np 4 python -m lab7.matmul_blocking --size 2000
+mpirun -np 4 python -m lab7.matmul_blocking --size 1400
 
-# Неблокирующий вариант
-mpirun -np 4 python -m lab7.matmul_nonblocking --size 2000
+# Неблокирующий конвейер
+mpirun -np 4 python -m lab7.matmul_nonblocking --size 1400
 
-# С верификацией результата
-mpirun -np 4 python -m lab7.matmul_blocking --size 2000 --verify
-```
-
-### Автоподбор размера под целевое время:
-```bash
-# Цель ~30 секунд
-mpirun -np 4 python -m lab7.matmul_blocking --target-time 30
+# Сравнение обоих (замер обоих + прирост скорости)
+mpirun -np 4 python -m lab7 compare --size 1400
 ```
 
 ### На кластере (3+ машины):
@@ -49,55 +43,54 @@ mpirun -np 4 python -m lab7.matmul_blocking --target-time 30
 # node2 slots=4
 # node3 slots=4
 
-mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 4000
+mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 1400
 ```
 
 ### Через entry point:
 ```bash
-# Блокирующий
-python -m lab7 blocking --size 2000
-
-# Неблокирующий
-python -m lab7 nonblocking --size 2000
-
-# Сравнение обоих
-python -m lab7 compare --size 2000
+python -m lab7 blocking --size 1400
+python -m lab7 nonblocking --size 1400
+python -m lab7 compare --size 1400
 ```
 
 ## Аргументы командной строки
 
 | Аргумент | Описание |
 |----------|----------|
-| `--size`, `-n` | Размер матрицы N×N (default: 2000) |
-| `--verify`, `-v` | Проверить корректность результата |
-| `--target-time`, `-t` | Автоподбор размера под целевое время (сек) |
+| `--size`, `-n` | Размер матрицы N×N (default: 1400) |
 
 ## Алгоритм
 
-1. **Rank 0** генерирует матрицы A(N×N) и B(N×N)
-2. **Bcast B** — матрица B рассылается всем процессам
-3. **Scatter A rows** — строки матрицы A делятся между процессами
-4. **Local compute** — каждый процесс вычисляет свои строки C = A_local @ B
-5. **Gather C** — результаты собираются в rank 0
+Матрица A режется на `NUM_CHUNKS = 6` блоков по строкам; B рассылается всем.
 
-## Ожидаемая производительность
+**1. Блокирующий режим** (`matmul_blocking.py`):
+```
+Rank 0: Send(B) всем -> для каждого чанка: Send(кусок A воркеру), Recv(кусок C от воркера)
+Воркер: Recv(B) -> для каждого чанка: Recv(кусок A), C_chunk = A_chunk @ B, Send(C_chunk)
+```
+Передача и вычисления не перекрываются — каждый шаг блокирующий.
 
-| Размер | Процессы | Блокирующий | Неблокирующий | Прирост |
-|--------|----------|-------------|---------------|---------|
-| 2000×2000 | 4 | ~3-5 сек | ~2.5-4 сек | 10-20% |
-| 4000×4000 | 8 | ~20-30 сек | ~18-25 сек | 10-30% |
-
-*Зависит от сети: InfiniBand/10GbE даёт больший прирост неблокирующего варианта.*
+**2. Неблокирующий конвейер** (`matmul_nonblocking.py`):
+```
+Rank 0: Isend(B), Waitall -> для каждого чанка: Isend(кусок A), Irecv(кусок C), Waitall
+Воркер: Irecv(B) -> prefetch первого чанка -> для каждого чанка:
+        1) Irecv(следующий чанк)      // фоновый приём k+1
+        2) C_chunk = A_chunk @ B      // вычисления параллельно с сетью
+        3) Wait(предыдущий Isend)     // дожидаемся отправки k-1
+        4) Isend(C_chunk)             // фоновая отправка ответа
+        5) Wait(приём k+1), переключить буфер (double buffering)
+```
+Благодаря двойной буферизации и prefetch коммуникация следующего чанка
+перекрывается с вычислением текущего — отсюда прирост скорости.
 
 ## Структура файлов
 
 ```
 lab7/
 ├── __main__.py              # Entry point (blocking/nonblocking/compare)
-├── matmul_blocking.py       # Блокирующий вариант (MPI_Send/Recv коллективы)
-├── matmul_nonblocking.py    # Неблокирующий (Ibcast/Iscatter/Igatherv + Waitall)
-├── utils.py                 # Генерация матриц, таймеры, верификация
-├── ANSWERS.md               # Ответы на 4 вопроса защиты
+├── matmul_blocking.py       # Блокирующий вариант (MPI_Send/Recv)
+├── matmul_nonblocking.py    # Неблокирующий конвейер (MPI_Isend/Irecv)
+├── ANSWERS.md               # Ответы на вопросы защиты
 ├── README.md                # Этот файл
 └── hosts                    # Пример файла хостов для кластера
 ```
@@ -111,7 +104,7 @@ lab7/
 
 ## Примечания
 
-- Для работы неблокирующих коллективов (Ibcast, Iscatter, Igatherv) требуется **MPI-3** и **mpi4py 3.0+**
-- На старых версиях используется fallback на ручные `MPI_Isend`/`MPI_Irecv`
-- `numpy` использует BLAS (OpenBLAS/MKL) для локального умножения — основная нагрузка на CPU
-- Коммуникация: Bcast O(log P), Scatter/Gather O(P) по времени
+- Требуется минимум **3 процесса** (`size < 3` → ошибка).
+- `numpy` ограничен 1 потоком на процесс (`OMP_NUM_THREADS=1`), чтобы процессы не душили друг друга на ядрах CPU.
+- Размер по умолчанию 1400×1400 (~10-25 сек на типичном CPU); при необходимости подберите 1200-1600.
+- На маленьких размерах (например 300) прирост может быть отрицательным — это нормально, эффект появляется на реальных размерах.

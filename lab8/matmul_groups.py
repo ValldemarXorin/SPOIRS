@@ -1,244 +1,192 @@
 """
-Lab 8: MPI Matrix Multiplication with Groups, Collective Operations, and MPI-IO.
+Lab 8: MPI Groups + MPI-IO + collective ops (logic from lr8.py).
+
+Случайное деление процессов на группы (MPI_Comm_split), параллельное чтение
+среза матрицы A из общего файла (MPI_File.Read_at_all), Bcast B внутри группы,
+локальное умножение, параллельная запись результата (Write_at_all) + замер
+последовательных парных операций для сравнения.
 """
 
+import os
+# Ограничиваем NumPy 1 потоком на процесс, чтобы они не душили друг друга на ядрах CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
+import time
 import argparse
 import numpy as np
 try:
     from mpi4py import MPI
 except (ImportError, OSError, RuntimeError) as _mpi_err:
     raise ImportError(
-        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
-        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
-        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        'mpi4py/MPI runtime не найден. Установите MPI:\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\n'
         f'Ошибка: {_mpi_err}'
     ) from _mpi_err
-from typing import List, Dict
 
-from lab8.groups import create_random_groups, GroupInfo, get_my_group, print_group_info
-from lab8.mpi_io import read_matrices_for_group, write_result_for_group
-from lab8.utils import (
-    timer,
-    verify_result,
-    print_matrix_info,
-    get_optimal_size_for_time,
-    compare_times_blocking_vs_collective,
-    write_matrices_to_files,
-)
+comm = MPI.COMM_WORLD
+global_rank = comm.Get_rank()
+global_size = comm.Get_size()
 
 
-def matmul_collective(
-    gcomm: MPI.Comm,
-    A_local: np.ndarray,
-    B: np.ndarray,
-) -> np.ndarray:
-    """
-    Matrix multiplication using collective operations within group.
-    """
-    rank = gcomm.Get_rank()
-    size = gcomm.Get_size()
-    n = B.shape[0]
-
-    # Broadcast B to all (already done in read phase, but ensure)
-    B = gcomm.bcast(B, root=0)
-
-    # Local computation
-    with timer(gcomm, f"Group {gcomm.Get_rank()} local matmul"):
-        C_local = A_local @ B
-
-    # Gather results using collective Gatherv
-    local_rows = A_local.shape[0]
-    rows_per_proc = gcomm.allgather(local_rows)
-    displs = np.zeros(size, dtype=int)
-    displs[1:] = np.cumsum(rows_per_proc)[:-1]
-
-    with timer(gcomm, f"Group {gcomm.Get_rank()} Gatherv"):
-        if rank == 0:
-            C = np.empty((n, n), dtype=np.float64)
-        else:
-            C = None
-        gcomm.Gatherv(
-            [C_local, MPI.DOUBLE],
-            [C, (rows_per_proc * n).tolist(), (displs * n).tolist(), MPI.DOUBLE],
-            root=0
-        )
-
-    return C if rank == 0 else None
+def generate_shared_files(n: int, file_a: str, file_b: str):
+    """Генерация бинарных файлов матриц на мастер-узле."""
+    if global_rank == 0:
+        np.random.seed(42)
+        A = np.random.rand(n, n).astype(np.float64)
+        B = np.random.rand(n, n).astype(np.float64)
+        A.tofile(file_a)
+        B.tofile(file_b)
+        print(f"[I/O] Сгенерированы файлы матриц: {file_a} и {file_b} ({n}x{n})")
+    comm.Barrier()
 
 
-def matmul_blocking_pairwise(
-    gcomm: MPI.Comm,
-    A_local: np.ndarray,
-    B: np.ndarray,
-) -> np.ndarray:
-    """
-    Matrix multiplication using pairwise send/recv (blocking).
-    Simulates the Lab 7 blocking approach within a group.
-    """
-    rank = gcomm.Get_rank()
-    size = gcomm.Get_size()
-    n = B.shape[0]
-
-    # Broadcast B
-    B = gcomm.bcast(B, root=0)
-
-    # Local computation
-    with timer(gcomm, f"Group {gcomm.Get_rank()} local matmul (pairwise)"):
-        C_local = A_local @ B
-
-    # Gather using pairwise sends (root receives from all)
-    local_rows = A_local.shape[0]
-    rows_per_proc = gcomm.allgather(local_rows)
-    displs = np.zeros(size, dtype=int)
-    displs[1:] = np.cumsum(rows_per_proc)[:-1]
-
-    with timer(gcomm, f"Group {gcomm.Get_rank()} Gather (pairwise)"):
-        if rank == 0:
-            C = np.empty((n, n), dtype=np.float64)
-            # Receive from other ranks
-            for src in range(1, size):
-                if rows_per_proc[src] > 0:
-                    src_rows = rows_per_proc[src]
-                    src_data = np.empty((src_rows, n), dtype=np.float64)
-                    gcomm.Recv([src_data, MPI.DOUBLE], source=src, tag=100)
-                    displ = displs[src] * n
-                    C[displ:displ + src_rows * n].reshape(src_rows, n)[:] = src_data
-            # Copy own data
-            displ = displs[0] * n
-            C[displ:displ + local_rows * n].reshape(local_rows, n)[:] = C_local
-        else:
-            C = None
-            gcomm.Send([C_local, MPI.DOUBLE], dest=0, tag=100)
-
-    return C if rank == 0 else None
-
-
-def run_group_multiplication(
-    gcomm: MPI.Comm,
-    n: int,
-    use_collective: bool,
-    verify: bool,
-) -> float:
-    """
-    Run matrix multiplication within a group.
-    Returns elapsed time on group root.
-    """
-    rank = gcomm.Get_rank()
-    size = gcomm.Get_size()
-
-    if size == 0:
-        return 0.0
-
-    # Read matrices for this group
-    filename_A = "matrix_A.bin"
-    filename_B = "matrix_B.bin"
-
-    with timer(gcomm, f"Group {gcomm.Get_rank()} MPI-IO read"):
-        A_local, B = read_matrices_for_group(gcomm, filename_A, filename_B, n)
-
-    print_matrix_info(f"Group {gcomm.Get_rank()} A_local", A_local)
-    print_matrix_info(f"Group {gcomm.Get_rank()} B", B)
-
-    # Run multiplication
-    if use_collective:
-        elapsed = matmul_collective(gcomm, A_local, B)
+def assign_random_groups(num_groups: int) -> int:
+    """Случайно распределяет процессы по группам (каждая группа получит >=1 процесс)."""
+    if global_rank == 0:
+        # Гарантируем, что в каждой группе есть минимум 1 процесс
+        mapping = list(range(num_groups))
+        # Оставшиеся процессы распределяем случайно
+        remaining = global_size - num_groups
+        if remaining > 0:
+            mapping.extend(np.random.randint(0, num_groups, size=remaining).tolist())
+        np.random.shuffle(mapping)
     else:
-        elapsed = matmul_blocking_pairwise(gcomm, A_local, B)
+        mapping = None
 
-    # Verification on group root
-    if rank == 0 and elapsed is not None and verify:
-        with timer(gcomm, f"Group {gcomm.Get_rank()} verification"):
-            # We'd need full A and B for verification - skip for now
-            pass
+    # Рассылаем распределение всем процессам
+    mapping = comm.bcast(mapping, root=0)
+    return mapping[global_rank]
 
-    return 0.0  # timer prints elapsed
+
+def compute_chunk_offsets(n: int, grank: int, gsize: int):
+    """Вычисляет количество строк и байтовое смещение для текущего процесса."""
+    counts = [n // gsize + (1 if i < (n % gsize) else 0) for i in range(gsize)]
+    displs = [sum(counts[:i]) for i in range(gsize)]
+    my_rows = counts[grank]
+    byte_offset = displs[grank] * n * 8  # float64 = 8 байт
+    return my_rows, byte_offset
+
+
+def run_group_matrix_multiplication(group_comm, group_id: int, n: int, file_a: str, file_b: str):
+    """Выполняет матричное умножение внутри группы с использованием MPI-IO и коллективных операций."""
+    grank = group_comm.Get_rank()
+    gsize = group_comm.Get_size()
+
+    my_rows, byte_offset = compute_chunk_offsets(n, grank, gsize)
+
+    group_comm.Barrier()
+    t_start = MPI.Wtime()
+
+    # 1. Параллельное чтение среза матрицы A напрямую из общего файла
+    A_sub = np.empty((my_rows, n), dtype=np.float64)
+    fh_a = MPI.File.Open(group_comm, file_a, MPI.MODE_RDONLY)
+    fh_a.Read_at_all(byte_offset, A_sub)
+    fh_a.Close()
+
+    # 2. Коллективная рассылка матрицы B внутри группы (Bcast)
+    B = np.empty((n, n), dtype=np.float64)
+    if grank == 0:
+        fh_b = MPI.File.Open(MPI.COMM_SELF, file_b, MPI.MODE_RDONLY)
+        fh_b.Read(B)
+        fh_b.Close()
+    group_comm.Bcast(B, root=0)
+
+    # 3. Локальные вычисления
+    C_sub = np.dot(A_sub, B)
+
+    # 4. Параллельная запись результата каждым процессом в файл своей группы
+    out_file = f"result_group_{group_id}.bin"
+    fh_out = MPI.File.Open(group_comm, out_file, MPI.MODE_CREATE | MPI.MODE_WRONLY)
+    fh_out.Write_at_all(byte_offset, C_sub)
+    fh_out.Close()
+
+    group_comm.Barrier()
+    t_group = MPI.Wtime() - t_start
+
+    # Максимальное время среди процессов группы
+    max_t = group_comm.reduce(t_group, op=MPI.MAX, root=0)
+    if grank == 0:
+        print(f"  • [Группа {group_id}] Процессов: {gsize:2d} | Время вычислений + I/O: {max_t:.4f} сек -> Файл: {out_file}")
+    return max_t
+
+
+def run_point_to_point_benchmark(n: int) -> float:
+    """Быстрый замер парных операций (Send/Recv) на глобальном коммуникаторе для сравнения."""
+    if global_rank == 0:
+        A = np.random.rand(n, n).astype(np.float64)
+        B = np.random.rand(n, n).astype(np.float64)
+        C = np.empty((n, n), dtype=np.float64)
+        t0 = time.time()
+        for w in range(1, global_size):
+            comm.Send(B, dest=w, tag=90)
+            comm.Send(A[0:10, :], dest=w, tag=91)
+            comm.Recv(C[0:10, :], source=w, tag=92)
+        return time.time() - t0
+    else:
+        B = np.empty((n, n), dtype=np.float64)
+        A_sub = np.empty((10, n), dtype=np.float64)
+        comm.Recv(B, source=0, tag=90)
+        comm.Recv(A_sub, source=0, tag=91)
+        C_sub = np.dot(A_sub, B)
+        comm.Send(C_sub, dest=0, tag=92)
+        return 0.0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lab 8: MPI Matrix Multiplication with Groups")
-    parser.add_argument("--size", "-n", type=int, default=2000, help="Matrix size N×N")
-    parser.add_argument("--groups", "-g", type=int, default=2, help="Number of groups")
-    parser.add_argument("--verify", "-v", action="store_true", help="Verify result")
-    parser.add_argument("--collective", "-c", action="store_true", help="Use collective operations (default)")
-    parser.add_argument("--pairwise", "-p", action="store_true", help="Use pairwise operations")
-    parser.add_argument("--target-time", "-t", type=float, help="Target time in seconds (auto-size)")
-    parser.add_argument("--gen-inputs", action="store_true", help="Generate input files matrix_A.bin, matrix_B.bin")
-    parser.add_argument("--input-A", default="matrix_A.bin", help="Input file for matrix A")
-    parser.add_argument("--input-B", default="matrix_B.bin", help="Input file for matrix B")
-    parser.add_argument("--output", "-o", default="result", help="Output file prefix")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--groups", type=int, default=2, help="Количество формируемых групп")
+    parser.add_argument("--dim", type=int, default=1200, help="Размерность матриц")
     args = parser.parse_args()
 
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    num_groups = args.groups
+    n = args.dim
 
-    n = args.size
-    if args.target_time:
-        n = get_optimal_size_for_time(args.target_time, comm)
+    if global_size < num_groups:
+        if global_rank == 0:
+            print(f"Ошибка: Количество процессов ({global_size}) должно быть >= количества групп ({num_groups})!")
+        sys.exit(1)
 
-    num_groups = min(args.groups, size)
+    file_a = "shared_matrix_A.bin"
+    file_b = "shared_matrix_B.bin"
 
-    use_collective = not args.pairwise  # default to collective
+    # Создание общих файлов
+    generate_shared_files(n, file_a, file_b)
 
-    if rank == 0:
-        print("=" * 60)
-        print("Lab 8: MPI Matrix Multiplication with Groups")
-        print("=" * 60)
-        print(f"Matrix size: {n}×{n}")
-        print(f"Total processes: {size}")
-        print(f"Number of groups: {num_groups}")
-        print(f"Mode: {'Collective' if use_collective else 'Pairwise'}")
-        print(f"Verify: {args.verify}")
-        print("-" * 60)
+    # 1. Случайное деление на группы (MPI_Comm_split)
+    my_group = assign_random_groups(num_groups)
+    group_comm = comm.Split(color=my_group, key=global_rank)
 
-    # Generate input files if requested
-    if args.gen_inputs:
-        if rank == 0:
-            print(f"[INFO] Generating input files...")
-        write_matrices_to_files(comm, args.input_A, args.input_B, n)
-        comm.Barrier()
-        if rank == 0:
-            print(f"[INFO] Input files generated: {args.input_A}, {args.input_B}")
-        return
+    if global_rank == 0:
+        print(f"\nЗапуск параллельных вычислений в {num_groups} группах...")
 
-    # Create random groups
-    with timer(comm, "Group creation (MPI_Comm_split)"):
-        groups = create_random_groups(comm, num_groups, seed=42)
+    # 2. Выполнение вычислений и параллельного вывода
+    run_group_matrix_multiplication(group_comm, my_group, n, file_a, file_b)
+    group_comm.Free()
 
-    print_group_info(groups, comm)
+    # 3. Замер парных операций для сравнения по методичке
+    comm.Barrier()
+    t_p2p = run_point_to_point_benchmark(n)
 
-    # Get this process's group
-    my_group = get_my_group(groups)
+    if global_rank == 0:
+        print("\n================== ИТОГИ СРАВНЕНИЯ ЛР №8 ==================")
+        print(f"1. Время последовательных парных операций (Send/Recv): {t_p2p:.4f} сек")
+        print("2. Коллективные операции + MPI File I/O позволили параллельно")
+        print("   обработать общие файлы без перегрузки мастер-узла.")
+        print("==========================================================")
 
-    if not my_group.is_member:
-        if rank == 0:
-            print(f"[WARN] Rank {rank} not assigned to any group")
-        return
-
-    # Run multiplication in this group
-    if rank == 0:
-        print(f"\n[Rank {rank}] Starting group {my_group.group_id} (size={my_group.size})")
-
-    elapsed = run_group_multiplication(
-        my_group.comm,
-        n,
-        use_collective,
-        args.verify,
-    )
-
-    # Write result
-    output_file = f"{args.output}_group{my_group.group_id}.bin"
-    if rank == 0:
-        print(f"[Group {my_group.group_id}] Writing result to {output_file}")
-
-    # Note: C_local is needed for writing, but we don't have it here
-    # In a full implementation, run_group_multiplication would return C_local
-
-    if rank == 0:
-        print("-" * 60)
-        print("Lab 8 completed")
-        print("=" * 60)
+        # Очистка файлов
+        print("\n[ПРОВЕРКА ФАЙЛОВ НА ДИСКЕ]:")
+        for g in range(num_groups):
+            out_file = f"result_group_{g}.bin"
+            if os.path.exists(out_file):
+                size_mb = os.path.getsize(out_file) / (1024 * 1024)
+                # Читаем первые 3 числа из бинарного файла, чтобы доказать, что там результат
+                sample_data = np.fromfile(out_file, dtype=np.float64, count=3)
+                print(f"  ✔ Файл {out_file} существует! Размер: {size_mb:.2f} МБ | Первые числа: {sample_data}")
 
 
 if __name__ == "__main__":

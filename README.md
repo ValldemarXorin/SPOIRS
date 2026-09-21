@@ -149,25 +149,20 @@ sudo python -m lab5 smurf --victim 192.168.1.10 --broadcast 192.168.1.255
 
 ### [ЛР6](./lab6/) — P2P чат: Broadcast + Multicast
 **Требование:** P2P чат, автоопределение IP/маски/broadcast, discovery, ignore list.
-**Бонус:** надёжная доставка — буфер отправки с ACK-подтверждениями, ретрансляцией
-и адаптивным RTO; fallback `--slow` для низкоскоростных сетей.
+Логика из эталонного `lr6.py`.
 
 | Файл | Описание |
 |------|----------|
-| `network.py` | Автоопределение IP через маршрут по умолчанию, broadcast = IP \| ~mask + спец-случай хотспота 172.20.10.x (/28) |
-| `protocol.py` | JSON сообщения: ping, text, ack |
-| `discovery.py` | `PeerDiscovery` — PING каждые 2.5с, TTL 10с |
-| `chat.py` | `P2PChat` — 1 recv-сокет (bcast+mcast) + reliability buffer (всегда включён) |
-| `cli.py` | Команды: `/name`, `/peers`, `/mode b\|m`, `/join`, `/leave`, `/ignore`, `/slow`, `/buffer`, `/rto`, `/quit` |
+| `network.py` | IP через маршрут по умолчанию, broadcast = IP \| ~mask + спец-случай хотспота 172.20.10.x (/28), сокеты |
+| `chat.py` | `P2PChat` — PING discovery (2.5с), send/receive, ignore, join/leave multicast |
+| `cli.py` | Команды: `/mode b\|m`, `/peers`, `/ignore`, `/unignore`, `/join`, `/leave`, `/exit` + argparse |
 | `ANSWERS.md` | Ответы на 5 вопросов защиты |
 
 **Команды чата:**
 ```
-/help           /name <имя>    /peers
-/ignore <ip>    /unignore <ip> /mode b|m
-/join           /leave         /slow
-/buffer         /rto           /net
-/quit
+/mode b|m       /peers          /ignore <ip>
+/unignore <ip>  /join           /leave
+/exit
 ```
 
 **Запуск:**
@@ -178,9 +173,6 @@ python -m lab6 -n "Alice"
 # Терминал 2
 python -m lab6 -n "Bob"
 
-# Fallback для низкоскоростной сети (RTO 5..120с, 12 попыток)
-python -m lab6 -n "Alice" --slow
-
 # Тестирование ignore
 # В Alice: /ignore 192.168.1.5  (IP Боба)
 # Сообщения Боба перестанут отображаться у Алисы
@@ -190,42 +182,41 @@ python -m lab6 -n "Alice" --slow
 
 ### [ЛР7](./lab7/) — MPI: Умножение матриц (Blocking / Non-blocking)
 **Требование:** 2 варианта, замер времени, неблокирующий быстрее (как CUDA Streams), 3+ машины.
+Логика из эталонного `lr7.py`.
 
 | Файл | Описание |
 |------|----------|
-| `matmul_blocking.py` | Блокирующий: Bcast B, Scatter A, local @, Gather C |
-| `matmul_nonblocking.py` | Неблокирующий: Ibcast/Iscatter/Igatherv (MPI-3) + Waitall, фоллбеки |
-| `utils.py` | Генерация матриц, таймеры (MPI.Wtime), верификация |
+| `matmul_blocking.py` | Блокирующий: Send(B), поштучная Send/Recv чанков A/C |
+| `matmul_nonblocking.py` | Неблокирующий конвейер: Isend/Irecv, double buffering, prefetch |
+| `__main__.py` | Entry point: `blocking` / `nonblocking` / `compare` |
 | `ANSWERS.md` | Ответы на 4 вопроса: MPI_COMM_WORLD, rank, Init/Finalize, async advantage |
 | `hosts` | Пример файла хостов для кластера |
 
-**Алгоритм (row-wise):**
+**Алгоритм (chunked pipeline, NUM_CHUNKS=6):**
 ```
 Rank 0: A(N×N), B(N×N)
     │
-    ├─ Bcast B → все ранги
-    ├─ Scatter A rows → A_local (N/size × N)
+    ├─ Send(B) → все воркеры
+    ├─ для каждого чанка: Send(кусок A воркеру) → Recv(кусок C)
     │
-    └─ Local: C_local = A_local @ B (numpy BLAS)
-        │
-        └─ Gather C → Rank 0
+    └─ Воркер: Recv(B) → для каждого чанка: Recv(A_chunk) → C_chunk = A_chunk @ B → Send(C_chunk)
 ```
+Неблокирующий вариант перекрывает приём следующего чанка с вычислением текущего
+(двойная буферизация + prefetch).
 
-**Запуск:**
+**Запуск (нужно ≥3 процесса):**
 ```bash
-# Генерация не требуется — матрицы создаются в ранке 0
-
 # Блокирующий (4 процесса)
-mpirun -np 4 python -m lab7.matmul_blocking --size 2000 --verify
+mpirun -np 4 python -m lab7.matmul_blocking --size 1400
 
-# Неблокирующий (MPI-3 Ibcast/Iscatter/Igatherv)
-mpirun -np 4 python -m lab7.matmul_nonblocking --size 2000 --verify
+# Неблокирующий конвейер
+mpirun -np 4 python -m lab7.matmul_nonblocking --size 1400
 
-# Автоподбор размера под ~30 сек
-mpirun -np 4 python -m lab7.matmul_nonblocking --target-time 30
+# Сравнение обоих + прирост скорости
+mpirun -np 4 python -m lab7 compare --size 1400
 
 # На кластере (12 процессов, 3 узла)
-mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 4000
+mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 1400
 ```
 
 **Ожидаемый прирост:** 10-30% на неблокирующем (перекрытие comm + compute).
@@ -234,13 +225,12 @@ mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 4000
 
 ### [ЛР8](./lab8/) — MPI: Группы, коллективные операции, MPI-IO
 **Требование:** Случайные группы (Comm_split), коллективные ops, MPI-IO, сравнение с парными.
+Логика из эталонного `lr8.py`.
 
 | Файл | Описание |
 |------|----------|
-| `groups.py` | `MPI_Comm_split` — случайные размеры групп, сумма = size |
-| `mpi_io.py` | `MPI_File_read_at_all` / `Write_at_all` — параллельный I/O |
-| `matmul_groups.py` | Интеграция: группы → коллективные/парные ops → MPI-IO |
-| `utils.py` | Генерация входных файлов, таймеры, сравнение collective vs pairwise |
+| `matmul_groups.py` | Вся логика: генерация файлов, случайные группы, MPI-IO, сравнение |
+| `__main__.py` | Entry point (`from lab8.matmul_groups import main`) |
 | `ANSWERS.md` | Ответы на 5 вопросов: Comm_split, коллективные vs парные, MPI_File, Wtime |
 | `hosts` | Пример файла хостов |
 
@@ -249,31 +239,30 @@ mpirun -np 12 -hostfile hosts python -m lab7.matmul_nonblocking --size 4000
 1. MPI_COMM_WORLD (size)
        │
        ▼
-2. MPI_Comm_split(color=group_id, key=rank)
+2. Генерация shared_matrix_A.bin / shared_matrix_B.bin (rank 0)
        │
-       ├──── Group 0 (size0) ── MPI-IO read A_local, B
-       ├──── Group 1 (size1) ── Collective Bcast/Scatter/Gather
-       ├──── Group 2 (size2) ── Local C_local = A_local @ B
-       └──── Group 3 (size3) ── MPI-IO write result_groupX.bin
+       ▼
+3. Случайное деление на группы (каждая >=1 процесс)
+       │
+       ▼
+4. MPI_Comm_split(color=group_id, key=rank)
+       │
+       ├─ MPI_File.Read_at_all — каждый читает свой срез A
+       ├─ Bcast(B) внутри группы
+       ├─ C_sub = A_sub @ B
+       └─ MPI_File.Write_at_all → result_group_<id>.bin
               │
               ▼
-3. MPI_Wtime в каждой группе → сравнение collective vs pairwise
+5. MPI_Wtime замер (reduce MAX) + замер парных Send/Recv для сравнения
 ```
 
-**Запуск:**
+**Запуск (процессов ≥ групп):**
 ```bash
-# 1. Генерация входных файлов (обязательно!)
-mpirun -np 8 python -m lab8 --gen-inputs --size 2000
-# Создаёт matrix_A.bin, matrix_B.bin через коллективный MPI-IO
+# 8 процессов, 2 группы, матрицы 1200x1200
+mpirun -np 8 python -m lab8 --dim 1200 --groups 2
 
-# 2. Коллективный режим (2 группы)
-mpirun -np 8 python -m lab8 --size 2000 --groups 2
-
-# 3. Парный режим (для сравнения)
-mpirun -np 8 python -m lab8 --size 2000 --groups 2 --pairwise
-
-# 4. На кластере
-mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4
+# На кластере (24 процесса, 4 группы)
+mpirun -np 24 -hostfile hosts python -m lab8 --dim 1200 --groups 4
 ```
 
 ---
@@ -294,29 +283,26 @@ mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4
 | Broadcast discovery | 2 терминала → оба видят друг друга через PING (~2.5с) |
 | Multicast join/leave | `/mode m` → `/join` → `/leave` |
 | Ignore list | `/ignore <ip>` — сообщения исчезают, `/unignore` — возвращаются |
-| Релиабельный буфер | `/buffer` — сообщение в буфере → приходит ACK → буфер пустеет; `/rto` — статистика RTO/SRTT |
-| Ретрансляция | Отключить сеть у получателя → сообщение ретраейтся с backoff (см. лог `[reliable] ... resending`), при восстановлении — доставляется |
-| Fallback для медленной сети | `python -m lab6 --slow` (RTO 5..120с) — сообщение не «сдаётся» на медленном канале |
+| Передача сообщений | Текст → `[Name @ IP]: текст` на другом хосте |
 | ANSWERS.md | Ответы на 5 вопросов (отличие bcast/mcast, формирование broadcast, диапазоны multicast, ограничения, область broadcast) |
 
 ### ЛР7 (MPI Matrix)
 | Что тестировать | Как показать |
 |----------------|--------------|
-| Блокирующий вариант | `mpirun -np 4 python -m lab7.matmul_blocking --size 2000 --verify` — показать время и PASSED |
-| Неблокирующий вариант | `mpirun -np 4 python -m lab7.matmul_nonblocking --size 2000 --verify` — показать время |
-| Сравнение | Запустить оба последовательно — неблокирующий быстрее 10-30% |
-| MPI-3 коллективы | Показать `hasattr(comm, 'Ibcast')` — True на современном MPI |
+| Блокирующий вариант | `mpirun -np 4 python -m lab7.matmul_blocking --size 1400` — показать время |
+| Неблокирующий вариант | `mpirun -np 4 python -m lab7.matmul_nonblocking --size 1400` — показать время |
+| Сравнение | `mpirun -np 4 python -m lab7 compare --size 1400` — итог с приростом скорости % |
+| Неблокирующий конвейер | Показать Isend/Irecv + double buffering + prefetch в `matmul_nonblocking.py` |
 | ANSWERS.md | 4 вопроса: MPI_COMM_WORLD, rank, Init/Finalize, преимущество async (CUDA Streams analogy) |
 
 ### ЛР8 (MPI Groups + IO)
 | Что тестировать | Как показать |
 |----------------|--------------|
-| Генерация входных файлов | `mpirun -np 8 python -m lab8 --gen-inputs --size 2000` → matrix_A.bin, matrix_B.bin |
-| Случайные группы | `mpirun -np 8 python -m lab8 --size 2000 --groups 2` — показать вывод group config |
-| Коллективные ops | Режим по умолчанию — Bcast/Scatter/Gather внутри групп |
-| Парные ops | `--pairwise` — ручные Send/Recv для сравнения |
-| MPI-IO | Показать `MPI_File_read_at_all` / `Write_at_all` в `mpi_io.py` |
-| Сравнение времени | На rank 0 выводится таблица collective vs pairwise |
+| Генерация общих файлов | rank 0 создаёт shared_matrix_A.bin / shared_matrix_B.bin при запуске |
+| Случайные группы | `mpirun -np 8 python -m lab8 --dim 1200 --groups 2` — показать группы |
+| MPI-IO | Показать `Read_at_all` / `Write_at_all` в `matmul_groups.py` |
+| Коллективные ops | `Bcast(B)` внутри группы, `reduce(MAX)` времени |
+| Сравнение времени | Итог: парные Send/Recv vs коллективные + MPI-IO; проверка файлов на диске |
 | ANSWERS.md | 5 вопросов: Comm_split, коллективные vs парные, MPI_File, Wtime, преимущества коллективных |
 
 ---

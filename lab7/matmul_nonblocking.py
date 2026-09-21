@@ -1,170 +1,147 @@
 """
-MPI Matrix Multiplication - Non-blocking Version.
-Uses MPI-3 non-blocking collectives (Ibcast, Iscatter, Igatherv) + Waitall.
-Falls back to blocking collectives when MPI-3 not available.
-Overlaps communication with computation (like CUDA Streams / cudaMemcpyAsync).
+MPI Matrix Multiplication - Non-Blocking Pipeline (logic from lr7.py).
+Настоящий неблокирующий конвейер (overlap): Isend/Irecv, double buffering,
+prefetch следующего чанка пока считаем текущий.
 """
 
+import os
+# Ограничиваем NumPy 1 потоком на процесс, чтобы они не душили друг друга на ядрах CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
+import time
 import argparse
 import numpy as np
 try:
     from mpi4py import MPI
 except (ImportError, OSError, RuntimeError) as _mpi_err:
     raise ImportError(
-        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
-        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
-        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        'mpi4py/MPI runtime не найден. Установите MPI:\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\n'
         f'Ошибка: {_mpi_err}'
     ) from _mpi_err
-from typing import Optional, Tuple, List
 
-from lab7.utils import (
-    generate_matrices,
-    split_matrix_rows,
-    timer,
-    verify_result,
-    print_matrix_info,
-    get_optimal_size_for_time,
-)
+DEFAULT_N = 1400      # Размерность матрицы (подберите 1200-1600 под скорость CPU)
+NUM_CHUNKS = 6        # На сколько блоков дробится задача каждого воркера
 
 
-def matmul_nonblocking(comm: MPI.Comm, n: int, verify: bool = False) -> float:
-    """
-    Non-blocking matrix multiplication using MPI-3 non-blocking collectives
-    with fallback to blocking collectives for older MPI.
-    """
+def init_matrices(n: int):
+    np.random.seed(42)
+    return np.random.rand(n, n).astype(np.float64), np.random.rand(n, n).astype(np.float64)
+
+
+def matmul_nonblocking(comm: MPI.Comm, n: int) -> float:
+    """Неблокирующий конвейер (overlap). Возвращает время на rank 0."""
     rank = comm.Get_rank()
     size = comm.Get_size()
-
-    # Check MPI-3 non-blocking collective availability
-    has_nb_collectives = all(hasattr(comm, attr) for attr in ['Ibcast', 'Iscatter', 'Igatherv'])
-
-    if rank == 0:
-        print(f"[INFO] MPI-3 non-blocking collectives: {has_nb_collectives}")
-
-    # Step 1: Generate matrices on root
-    if rank == 0:
-        print(f"[Rank {rank}] Generating {n}×{n} matrices...")
-        with timer(comm, "Matrix generation"):
-            A, B = generate_matrices(n)
-        print_matrix_info("A", A)
-        print_matrix_info("B", B)
-    else:
-        A = None
-        B = None
-
-    # Step 2: Determine distribution
-    local_rows, rows_per_proc, displs = split_matrix_rows(
-        A if rank == 0 else np.empty((0, n)), comm
-    )
-
-    # Step 3: Non-blocking broadcast of B
-    if has_nb_collectives:
-        with timer(comm, "Ibcast B (MPI-3)"):
-            req_bcast = comm.Ibcast(B, root=0)
-    else:
-        # Fallback: blocking broadcast (can't truly overlap without MPI-3)
-        with timer(comm, "Bcast B (blocking fallback)"):
-            B = comm.bcast(B, root=0)
-        req_bcast = None
-
-    # Step 4: Non-blocking scatter of A rows
-    if has_nb_collectives:
-        with timer(comm, "Iscatter A rows (MPI-3)"):
-            A_local = np.empty((local_rows, n), dtype=np.float64)
-            req_scatter = comm.Iscatter([A, MPI.DOUBLE], [A_local, MPI.DOUBLE], root=0)
-    else:
-        # Fallback: blocking scatter
-        with timer(comm, "Scatter A rows (blocking fallback)"):
-            A_local = np.empty((local_rows, n), dtype=np.float64)
-            comm.Scatter([A, MPI.DOUBLE], [A_local, MPI.DOUBLE], root=0)
-        req_scatter = None
-
-    # Step 5: Wait for communications to complete
-    requests = []
-    if req_bcast:
-        requests.append(req_bcast)
-    if req_scatter:
-        requests.append(req_scatter)
-
-    if requests:
-        with timer(comm, "Waitall (comm completion)"):
-            MPI.Request.Waitall(requests)
+    workers = size - 1
+    rows_per_worker = n // workers
 
     if rank == 0:
-        print(f"[Rank {rank}] Local A shape: {A_local.shape}")
-        print(f"[Rank {rank}] B shape: {B.shape}")
-        print(f"[Rank {rank}] Rows per proc: {rows_per_proc}, Displs: {displs}")
+        A, B = init_matrices(n)
+        start_t = time.time()
 
-    # Step 6: Local matrix multiplication
-    with timer(comm, "Local matmul (A_local @ B)"):
-        C_local = A_local @ B
+        # Асинхронная рассылка B
+        reqs_b = [comm.Isend(B, dest=w, tag=10) for w in range(1, size)]
+        MPI.Request.Waitall(reqs_b)
 
-    # Step 7: Non-blocking gather
-    if has_nb_collectives:
-        with timer(comm, "Igatherv C (MPI-3)"):
-            if rank == 0:
-                C = np.empty((n, n), dtype=np.float64)
-            else:
-                C = None
-            req_gather = comm.Igatherv(
-                [C_local, MPI.DOUBLE],
-                [C, (rows_per_proc * n).tolist(), (displs * n).tolist(), MPI.DOUBLE],
-                root=0
-            )
-            req_gather.Wait()
+        C = np.empty((n, n), dtype=np.float64)
+        chunk_rows = rows_per_worker // NUM_CHUNKS
+
+        # Конвейерная отправка и сбор
+        for ch in range(NUM_CHUNKS):
+            send_reqs = []
+            recv_reqs = []
+            for w in range(1, size):
+                w_offset = (w - 1) * rows_per_worker
+                r_start = w_offset + ch * chunk_rows
+                r_end = (w_offset + rows_per_worker) if ch == NUM_CHUNKS - 1 else (r_start + chunk_rows)
+
+                s_req = comm.Isend(A[r_start:r_end, :], dest=w, tag=20 + ch)
+                r_req = comm.Irecv(C[r_start:r_end, :], source=w, tag=40 + ch)
+                send_reqs.append(s_req)
+                recv_reqs.append(r_req)
+
+            MPI.Request.Waitall(send_reqs)
+            MPI.Request.Waitall(recv_reqs)
+
+        elapsed = time.time() - start_t
+        return elapsed
     else:
-        # Fallback: blocking gather
-        with timer(comm, "Gather C (blocking fallback)"):
-            C = None
-            if rank == 0:
-                C = np.empty((n, n), dtype=np.float64)
-            comm.Gatherv(
-                [C_local, MPI.DOUBLE],
-                [C, (rows_per_proc * n).tolist(), (displs * n).tolist(), MPI.DOUBLE],
-                root=0
-            )
+        B = np.empty((n, n), dtype=np.float64)
+        req_b = comm.Irecv(B, source=0, tag=10)
+        req_b.Wait()
 
-    # Step 8: Verification (optional)
-    if rank == 0 and C is not None:
-        print_matrix_info("C", C)
+        my_rows = rows_per_worker
+        chunk_rows = my_rows // NUM_CHUNKS
 
-        if verify:
-            with timer(comm, "Verification"):
-                verify_result(C, A, B)
+        # Буферы двойной буферизации (Double Buffering)
+        r_count_0 = chunk_rows
+        curr_A = np.empty((r_count_0, n), dtype=np.float64)
 
-    return 0.0
+        # Предварительная выборка первого чанка (Prefetch)
+        req_recv = comm.Irecv(curr_A, source=0, tag=20)
+        req_recv.Wait()
+
+        prev_send_req = None
+
+        for ch in range(NUM_CHUNKS):
+            # 1. Запускаем фоновый прием СЛЕДУЮЩЕГО чанка k+1 (пока считаем чанк k)
+            if ch + 1 < NUM_CHUNKS:
+                next_count = (my_rows - (ch + 1) * chunk_rows) if (ch + 1) == NUM_CHUNKS - 1 else chunk_rows
+                next_A = np.empty((next_count, n), dtype=np.float64)
+                next_recv_req = comm.Irecv(next_A, source=0, tag=20 + ch + 1)
+
+            # 2. ВЫЧИСЛЕНИЯ на CPU (параллельно с сетевой передачей!)
+            C_chunk = np.dot(curr_A, B)
+
+            # 3. Ждем завершения фоновой отправки ПРЕДЫДУЩЕГО ответа
+            if prev_send_req is not None:
+                prev_send_req.Wait()
+
+            # 4. Запускаем фоновую отправку текущего ответа в память
+            prev_send_req = comm.Isend(C_chunk, dest=0, tag=40 + ch)
+
+            # 5. Переключаем буферы на следующий шаг
+            if ch + 1 < NUM_CHUNKS:
+                next_recv_req.Wait()
+                curr_A = next_A
+
+        if prev_send_req is not None:
+            prev_send_req.Wait()
+
+        return 0.0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MPI Matrix Multiplication - Non-blocking")
-    parser.add_argument("--size", "-n", type=int, default=2000, help="Matrix size N×N")
-    parser.add_argument("--verify", "-v", action="store_true", help="Verify result")
-    parser.add_argument("--target-time", "-t", type=float, help="Target time in seconds (auto-size)")
+    parser = argparse.ArgumentParser(description="MPI Matrix Multiplication - Non-Blocking (lr7)")
+    parser.add_argument("--size", "-n", type=int, default=DEFAULT_N, help="Matrix size N×N")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
+    size = comm.Get_size()
 
-    n = args.size
-    if args.target_time:
-        n = get_optimal_size_for_time(args.target_time, comm)
+    if size < 3:
+        if rank == 0:
+            print("Ошибка: Требуется запуск минимум на 3-х процессах!")
+        sys.exit(1)
 
     if rank == 0:
         print("=" * 60)
         print("MPI Matrix Multiplication - NON-BLOCKING VERSION")
         print("=" * 60)
-        print(f"Matrix size: {n}×{n}")
-        print(f"Processes: {comm.Get_size()}")
-        print(f"Verify: {args.verify}")
-        print(f"MPI-3 non-blocking collectives: {hasattr(comm, 'Ibcast')}")
+        print(f"Matrix size: {args.size}×{args.size}")
+        print(f"Processes: {size}")
         print("-" * 60)
 
-    matmul_nonblocking(comm, n, args.verify)
+    elapsed = matmul_nonblocking(comm, args.size)
 
     if rank == 0:
-        print("-" * 60)
+        print(f"Неблокирующий конвейер: {elapsed:.4f} сек")
         print("=" * 60)
 
 

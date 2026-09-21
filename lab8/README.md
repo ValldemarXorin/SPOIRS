@@ -1,13 +1,15 @@
-# Lab 8: MPI Matrix Multiplication with Groups, Collective Ops, and MPI-IO
+# Lab 8: MPI Groups + MPI-IO (Matrix Multiplication in Random Groups)
 
-Расширение Lab 7: умножение матриц в случайных группах процессов с использованием коллективных операций и параллельного MPI-IO.
+Логика из эталонного `lr8.py`: случайное деление процессов на группы (`MPI_Comm_split`),
+параллельное чтение матриц из общих файлов (`MPI_File.Read_at_all`), коллективный
+`Bcast` внутри групп, локальное умножение и параллельная запись результата
+(`MPI_File.Write_at_all`) + замер последовательных парных операций для сравнения.
 
 ## Возможности
-- **Случайные группы** — `MPI_Comm_split` с рандомными размерами (сумма = общее число процессов)
-- **Коллективные операции** — Bcast/Scatter/Gather/Allreduce внутри групп
-- **Парные операции** — альтернативный режим с ручными Send/Recv
-- **MPI-IO** — параллельное чтение/запись матриц (`MPI_File_read_at_all`/`Write_at_all`)
-- **Замеры времени** — `MPI_Wtime` в каждой группе, сравнение collective vs pairwise
+- **Случайные группы** — `MPI_Comm_split`, в каждой группе минимум 1 процесс
+- **MPI-IO** — параллельное чтение среза A из общего файла и запись результата по группам
+- **Коллективные операции** — `Bcast` матрицы B внутри группы, `reduce(MAX)` времени
+- **Сравнение с парными операциями** — замер последовательных `Send/Recv` на `COMM_WORLD`
 
 ## Требования
 - Python 3.8+
@@ -28,49 +30,20 @@ pip install mpi4py numpy
 
 ## Запуск
 
-### Генерация входных файлов (обязательно перед первым запуском):
-```bash
-mpirun -np 8 python -m lab8 --gen-inputs --size 2000
-```
-Создаёт `matrix_A.bin` и `matrix_B.bin` через коллективный MPI-IO.
-
-### Коллективный режим (по умолчанию):
 ```bash
 # Локально (8 процессов, 2 группы)
-mpirun -np 8 python -m lab8 --size 2000 --groups 2
+mpirun -np 8 python -m lab8 --dim 1200 --groups 2
 
 # На кластере (24 процесса, 4 группы)
-mpirun -np 24 -hostfile hosts python -m lab8 --size 4000 --groups 4
-```
-
-### Парный режим (для сравнения):
-```bash
-mpirun -np 8 python -m lab8 --size 2000 --groups 2 --pairwise
-```
-
-### Автоподбор размера под целевое время:
-```bash
-mpirun -np 8 python -m lab8 --target-time 30 --groups 2
+mpirun -np 24 -hostfile hosts python -m lab8 --dim 1200 --groups 4
 ```
 
 ## Аргументы командной строки
 
 | Аргумент | Описание |
 |----------|----------|
-| `--size`, `-n` | Размер матрицы N×N (default: 2000) |
-| `--groups`, `-g` | Число групп (default: 2, max: num_procs) |
-| `--verify`, `-v` | Проверить результат (требует полные A, B в памяти) |
-| `--collective`, `-c` | Использовать коллективные операции (default) |
-| `--pairwise`, `-p` | Использовать парные Send/Recv |
-| `--target-time`, `-t` | Автоподбор размера под время (сек) |
-| `--gen-inputs` | Сгенерировать matrix_A.bin, matrix_B.bin |
-| `--input-A` | Файл матрицы A (default: matrix_A.bin) |
-| `--input-B` | Файл матрицы B (default: matrix_B.bin) |
-| `--output`, `-o` | Префикс выходных файлов (default: result) |
-
-## Выходные файлы
-- `result_group0.bin`, `result_group1.bin`, ... — результаты по группам
-- Каждый файл содержит полную матрицу C = A × B, собранную из частей группы
+| `--groups` | Количество формируемых групп (default: 2) |
+| `--dim` | Размерность матриц (default: 1200) |
 
 ## Алгоритм
 
@@ -78,43 +51,41 @@ mpirun -np 8 python -m lab8 --target-time 30 --groups 2
 1. MPI_COMM_WORLD (size процессов)
         │
         ▼
-2. MPI_Comm_split(color=group_id, key=rank)
-        │
-        ├──────────┬──────────┬──────────┐
-        ▼          ▼          ▼          ▼
-      Group 0    Group 1    Group 2    Group 3
-      (size0)    (size1)    (size2)    (size3)
-        │          │          │          │
-        ▼          ▼          ▼          ▼
-3. MPI-IO read: A_local, B  (коллективное чтение)
+2. Генерация общих файлов shared_matrix_A.bin / shared_matrix_B.bin (rank 0)
         │
         ▼
-4. Коллективные ops / Парные ops:
-   • Bcast B
-   • Scatter A rows (или ручная раздача)
-   • Local C_local = A_local @ B
-   • Gatherv C / ручной сбор
+3. Случайное распределение по группам (каждая >=1 процесс)
         │
         ▼
-5. MPI_Wtime замер в каждой группе
+4. MPI_Comm_split(color=group_id, key=rank)
         │
         ▼
-6. MPI-IO write: result_groupX.bin
+5. В каждой группе:
+   • MPI_File.Read_at_all(offset) — каждый процесс читает свой срез строк A
+   • Bcast(B, root=0) — рассылка B внутри группы
+   • C_sub = A_sub @ B           — локальное умножение
+   • MPI_File.Write_at_all()     — параллельная запись в result_group_<id>.bin
+   • reduce(MAX) времени по группе
         │
         ▼
-7. Сравнение времени на rank 0
+6. Замер последовательных парных операций (Send/Recv) для сравнения
+        │
+        ▼
+7. Итог + проверка файлов на диске (размер, первые числа)
 ```
+
+## Выходные файлы
+- `shared_matrix_A.bin`, `shared_matrix_B.bin` — общие входные матрицы
+- `result_group_0.bin`, `result_group_1.bin`, ... — результаты по группам
+- В конце `main` печатает размер файлов и первые числа из них
 
 ## Структура файлов
 
 ```
 lab8/
-├── __main__.py              # Entry point
-├── matmul_groups.py         # Основная логика групп
-├── groups.py                # MPI_Comm_split с рандомными размерами
-├── mpi_io.py                # MPI_File read_at_all/write_at_all
-├── utils.py                 # Генерация, таймеры, верификация, сравнение
-├── ANSWERS.md               # 5 вопросов защиты
+├── __main__.py              # Entry point (imports matmul_groups.main)
+├── matmul_groups.py         # Вся логика lr8.py (группы + MPI-IO + сравнение)
+├── ANSWERS.md               # Ответы на вопросы защиты
 ├── README.md                # Этот файл
 └── hosts                    # Пример файла хостов
 ```
@@ -129,6 +100,6 @@ lab8/
 
 ## Примечания
 - **MPI-IO** требует общей файловой системы (NFS, Lustre, GPFS) или одинаковых путей на всех узлах
-- **Коллективные операции** (`_all` версии) эффективнее — MPI агрегирует I/O
-- **Случайные группы** — seed=42 для воспроизводимости
-- **Размер группы ≥ 1** — гарантируется при распределении
+- **Количество процессов >= количество групп** — иначе ошибка
+- `numpy` ограничен 1 потоком на процесс (`OMP_NUM_THREADS=1`)
+- Файлы создаются в рабочей директории запуска

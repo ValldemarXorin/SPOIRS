@@ -1,118 +1,116 @@
 """
-MPI Matrix Multiplication - Blocking Version.
-Uses MPI_Send/Recv (via Scatter, Bcast, Gather collectives).
+MPI Matrix Multiplication - Blocking Version (logic from lr7.py).
+Пошаговая блокирующая передача чанков: Send(B), затем по NUM_CHUNKS шагов
+Send(кусок A) -> Recv(кусок C) для каждого воркера.
 """
 
+import os
+# Ограничиваем NumPy 1 потоком на процесс, чтобы они не душили друг друга на ядрах CPU
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
+import time
 import argparse
 import numpy as np
 try:
     from mpi4py import MPI
 except (ImportError, OSError, RuntimeError) as _mpi_err:
     raise ImportError(
-        'mpi4py/MPI runtime не найден. Установите MPI:\\n'
-        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\\n'
-        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\\n'
+        'mpi4py/MPI runtime не найден. Установите MPI:\n'
+        '  Linux:  sudo apt-get install openmpi-bin libopenmpi-dev python3-dev && pip install mpi4py\n'
+        '  Windows: MS-MPI (https://docs.microsoft.com/en-us/message-passing-interface/microsoft-mpi) + pip install mpi4py\n'
         f'Ошибка: {_mpi_err}'
     ) from _mpi_err
 
-from lab7.utils import (
-    generate_matrices,
-    split_matrix_rows,
-    scatter_matrix_rows,
-    gather_matrix_rows,
-    timer,
-    verify_result,
-    print_matrix_info,
-    get_optimal_size_for_time,
-)
+DEFAULT_N = 1400      # Размерность матрицы (подберите 1200-1600 под скорость CPU)
+NUM_CHUNKS = 6        # На сколько блоков дробится задача каждого воркера
 
 
-def matmul_blocking(comm: MPI.Comm, n: int, verify: bool = False) -> float:
-    """
-    Blocking matrix multiplication using MPI collectives.
-    Returns elapsed time on rank 0.
-    """
+def init_matrices(n: int):
+    np.random.seed(42)
+    return np.random.rand(n, n).astype(np.float64), np.random.rand(n, n).astype(np.float64)
+
+
+def matmul_blocking(comm: MPI.Comm, n: int) -> float:
+    """Блокирующий режим. Возвращает время на rank 0."""
     rank = comm.Get_rank()
     size = comm.Get_size()
+    workers = size - 1
+    total_rows = n
+    rows_per_worker = total_rows // workers
 
-    # Step 1: Generate matrices on root
     if rank == 0:
-        print(f"[Rank {rank}] Generating {n}×{n} matrices...")
-        with timer(comm, "Matrix generation"):
-            A, B = generate_matrices(n)
-        print_matrix_info("A", A)
-        print_matrix_info("B", B)
+        A, B = init_matrices(n)
+        start_t = time.time()
+
+        # Рассылка B
+        for w in range(1, size):
+            comm.Send(B, dest=w, tag=1)
+
+        # Пошаговая блокирующая передача чанков
+        C = np.empty((n, n), dtype=np.float64)
+        chunk_rows = rows_per_worker // NUM_CHUNKS
+
+        for ch in range(NUM_CHUNKS):
+            for w in range(1, size):
+                w_offset = (w - 1) * rows_per_worker
+                r_start = w_offset + ch * chunk_rows
+                r_end = (w_offset + rows_per_worker) if ch == NUM_CHUNKS - 1 else (r_start + chunk_rows)
+                # Блокирующая отправка куска
+                comm.Send(A[r_start:r_end, :], dest=w, tag=2)
+                # Блокирующий прием результата
+                comm.Recv(C[r_start:r_end, :], source=w, tag=3)
+
+        elapsed = time.time() - start_t
+        return elapsed
     else:
-        A = None
-        B = None
+        B = np.empty((n, n), dtype=np.float64)
+        comm.Recv(B, source=0, tag=1)
 
-    # Step 2: Broadcast matrix B to all processes
-    with timer(comm, "Bcast B"):
-        B = comm.bcast(B, root=0)
+        my_rows = rows_per_worker
+        chunk_rows = my_rows // NUM_CHUNKS
 
-    # Step 3: Scatter rows of A
-    local_rows, rows_per_proc, displs = split_matrix_rows(A if rank == 0 else np.empty((0, n)), comm)
+        for ch in range(NUM_CHUNKS):
+            r_count = (my_rows - ch * chunk_rows) if ch == NUM_CHUNKS - 1 else chunk_rows
+            A_chunk = np.empty((r_count, n), dtype=np.float64)
+            # Ждем данные
+            comm.Recv(A_chunk, source=0, tag=2)
+            # Считаем
+            C_chunk = np.dot(A_chunk, B)
+            # Ждем отправку
+            comm.Send(C_chunk, dest=0, tag=3)
 
-    with timer(comm, "Scatter A rows"):
-        A_local = scatter_matrix_rows(comm, A, local_rows, n)
-
-    if rank == 0:
-        print(f"[Rank {rank}] Local A shape: {A_local.shape}")
-        print(f"[Rank {rank}] B shape: {B.shape}")
-        print(f"[Rank {rank}] Rows per proc: {rows_per_proc}, Displs: {displs}")
-
-    # Step 4: Local matrix multiplication
-    with timer(comm, "Local matmul (A_local @ B)"):
-        C_local = A_local @ B
-
-    # Step 5: Gather results
-    with timer(comm, "Gather C"):
-        C = gather_matrix_rows(comm, C_local, rows_per_proc, displs, n)
-
-    # Step 6: Verification (optional)
-    elapsed = 0.0
-    if rank == 0 and C is not None:
-        print_matrix_info("C", C)
-
-        if verify:
-            with timer(comm, "Verification"):
-                verify_result(C, A, B)
-
-        elapsed = 0.0  # Timer context manager prints time
-
-    return elapsed
+        return 0.0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MPI Matrix Multiplication - Blocking")
-    parser.add_argument("--size", "-n", type=int, default=2000, help="Matrix size N×N")
-    parser.add_argument("--verify", "-v", action="store_true", help="Verify result")
-    parser.add_argument("--target-time", "-t", type=float, help="Target time in seconds (auto-size)")
+    parser = argparse.ArgumentParser(description="MPI Matrix Multiplication - Blocking (lr7)")
+    parser.add_argument("--size", "-n", type=int, default=DEFAULT_N, help="Matrix size N×N")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
+    size = comm.Get_size()
 
-    n = args.size
-    if args.target_time:
-        n = get_optimal_size_for_time(args.target_time, comm)
+    if size < 3:
+        if rank == 0:
+            print("Ошибка: Требуется запуск минимум на 3-х процессах!")
+        sys.exit(1)
 
     if rank == 0:
         print("=" * 60)
         print("MPI Matrix Multiplication - BLOCKING VERSION")
         print("=" * 60)
-        print(f"Matrix size: {n}×{n}")
-        print(f"Processes: {comm.Get_size()}")
-        print(f"Verify: {args.verify}")
+        print(f"Matrix size: {args.size}×{args.size}")
+        print(f"Processes: {size}")
         print("-" * 60)
 
-    # Run multiplication
-    elapsed = matmul_blocking(comm, n, args.verify)
+    elapsed = matmul_blocking(comm, args.size)
 
     if rank == 0:
-        print("-" * 60)
-        print(f"Total time (rank 0): {elapsed:.4f} s")
+        print(f"Блокирующий режим: {elapsed:.4f} сек")
         print("=" * 60)
 
 
